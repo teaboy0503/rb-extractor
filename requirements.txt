@@ -5,3 +5,4 @@ httpx
 google-cloud-vision
 google-auth
 openai
+Pillow
