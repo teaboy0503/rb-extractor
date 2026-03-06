@@ -1,3 +1,5 @@
+from PIL import Image, ExifTags
+import io
 import os
 import json
 import re
@@ -34,7 +36,7 @@ MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="RB Extractor", version="1.0.0")
+app = FastAPI(title="RB Extractor", version="1.1.0")
 
 
 # -----------------------------
@@ -61,6 +63,60 @@ def require_bearer_auth(req: Request) -> None:
     token = auth.split(" ", 1)[1].strip()
     if token != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid token")
+
+
+# -----------------------------
+# Image orientation correction
+# -----------------------------
+def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
+    """
+    Reads EXIF orientation data and rotates the image if necessary.
+    Returns:
+      - corrected image bytes
+      - orientation action string for debug
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        orientation_tag = None
+
+        for tag, name in ExifTags.TAGS.items():
+            if name == "Orientation":
+                orientation_tag = tag
+                break
+
+        orientation_action = "none"
+
+        exif = image._getexif()
+        if exif is not None and orientation_tag is not None:
+            orientation_value = exif.get(orientation_tag)
+
+            if orientation_value == 3:
+                image = image.rotate(180, expand=True)
+                orientation_action = "rotated_180"
+            elif orientation_value == 6:
+                image = image.rotate(270, expand=True)
+                orientation_action = "rotated_270"
+            elif orientation_value == 8:
+                image = image.rotate(90, expand=True)
+                orientation_action = "rotated_90"
+            else:
+                orientation_action = f"exif_present_no_rotation_{orientation_value}"
+        else:
+            orientation_action = "no_exif"
+
+        output = io.BytesIO()
+
+        # Preserve PNG if present, otherwise save as JPEG
+        fmt = image.format if image.format in ["JPEG", "PNG"] else "JPEG"
+        if fmt == "JPEG" and image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+
+        image.save(output, format=fmt)
+        return output.getvalue(), orientation_action
+
+    except Exception as e:
+        # If anything fails just return original image
+        return image_bytes, f"orientation_fix_failed:{str(e)}"
 
 
 # -----------------------------
@@ -134,7 +190,6 @@ def roman_to_int(s: str) -> Optional[int]:
             total += val
             prev = val
 
-    # plausible printing years for your collection
     if 1400 <= total <= 2026:
         return total
     return None
@@ -153,12 +208,11 @@ def coerce_year(value: Any) -> Optional[int]:
         return iv if 1400 <= iv <= 2026 else None
 
     s = str(value).strip()
-    # digits first
+
     m = re.search(r"\b(1[4-9]\d{2}|20[0-2]\d)\b", s)
     if m:
         return int(m.group(1))
 
-    # roman
     r = roman_to_int(s)
     return r
 
@@ -199,7 +253,6 @@ def llm_parse_title_page(ocr_text: str) -> Dict[str, Any]:
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    # Keep prompt bounded
     text = ocr_text.strip()
     if len(text) > MAX_OCR_CHARS_FOR_LLM:
         text = text[:MAX_OCR_CHARS_FOR_LLM]
@@ -250,12 +303,10 @@ def llm_parse_title_page(ocr_text: str) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse LLM JSON: {str(e)}")
 
-    # Normalize/coerce
     parsed["language"] = normalize_language(parsed.get("language"))
     parsed["llm_confidence"] = clamp01(parsed.get("llm_confidence"))
     parsed["publication_year"] = coerce_year(parsed.get("publication_year"))
 
-    # Ensure keys exist
     for k in ["title", "author", "publication_place", "publisher", "edition_statement"]:
         if k not in parsed or parsed[k] is None:
             parsed[k] = ""
@@ -286,13 +337,16 @@ async def extract(req: Request, body: ExtractRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to download image: {str(e)}")
 
-    # 2) OCR
+    # 2) Fix image orientation before OCR
+    image_bytes, orientation_action = fix_image_orientation(image_bytes)
+
+    # 3) OCR
     ocr_text, ocr_conf = run_ocr_document_text(image_bytes)
 
-    # 3) LLM parse
+    # 4) LLM parse
     parsed = llm_parse_title_page(ocr_text)
 
-    # 4) Return combined payload (Airtable script will write fields)
+    # 5) Return combined payload (Airtable script will write fields)
     return {
         "record_id": body.record_id,
         "ocr_text": ocr_text,
@@ -313,5 +367,6 @@ async def extract(req: Request, body: ExtractRequest):
             "item_id": body.item_id,
             "model": OPENAI_MODEL,
             "ocr_chars_sent_to_llm": min(len(ocr_text), MAX_OCR_CHARS_FOR_LLM),
+            "orientation_action": orientation_action,
         }
     }
