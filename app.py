@@ -36,11 +36,11 @@ MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="RB Extractor", version="1.1.0")
+app = FastAPI(title="RB Extractor", version="1.3.0")
 
 
 # -----------------------------
-# Request/Response models
+# Request model
 # -----------------------------
 class ExtractRequest(BaseModel):
     record_id: str
@@ -106,7 +106,6 @@ def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
 
         output = io.BytesIO()
 
-        # Preserve PNG if present, otherwise save as JPEG
         fmt = image.format if image.format in ["JPEG", "PNG"] else "JPEG"
         if fmt == "JPEG" and image.mode in ("RGBA", "P"):
             image = image.convert("RGB")
@@ -115,7 +114,6 @@ def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
         return output.getvalue(), orientation_action
 
     except Exception as e:
-        # If anything fails just return original image
         return image_bytes, f"orientation_fix_failed:{str(e)}"
 
 
@@ -168,10 +166,6 @@ def run_ocr_document_text(image_bytes: bytes) -> Tuple[str, float]:
 _ROMAN_MAP = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
 
 def roman_to_int(s: str) -> Optional[int]:
-    """
-    Converts roman numerals like 'MDCCLXV' to 1765.
-    Returns None if not plausible.
-    """
     if not s:
         return None
     s = re.sub(r"[^IVXLCDM]", "", s.upper())
@@ -196,9 +190,6 @@ def roman_to_int(s: str) -> Optional[int]:
 
 
 def coerce_year(value: Any) -> Optional[int]:
-    """
-    Accepts int or strings like '1765', 'MDCCLXV', '1765?'.
-    """
     if value is None:
         return None
     if isinstance(value, int):
@@ -245,9 +236,9 @@ def clamp01(x: Any) -> float:
 
 
 # -----------------------------
-# OpenAI parsing
+# OpenAI parsing (OCR text + image)
 # -----------------------------
-def llm_parse_title_page(ocr_text: str) -> Dict[str, Any]:
+def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY env var not set on server")
 
@@ -259,21 +250,26 @@ def llm_parse_title_page(ocr_text: str) -> Dict[str, Any]:
 
     system = (
         "You are a careful rare-books cataloguer. "
-        "You extract bibliographic metadata from OCR text of a TITLE PAGE. "
+        "You extract bibliographic metadata from a rare book title page using BOTH the OCR text and the image itself. "
+        "Use the image to interpret layout, line grouping, imprint position, emphasis and details that OCR may miss. "
         "Return STRICT JSON only. No markdown. No explanation."
     )
 
-    user_obj = {
-        "task": "Extract bibliographic fields from OCR text of a rare book title page.",
+    user_text = {
+        "task": "Extract bibliographic metadata from a rare book title page using the OCR text and the title page image.",
         "ocr_text": text,
         "output_rules": [
-            "Do not invent details not supported by the OCR text.",
+            "Do not invent details not supported by the OCR text or visible image.",
             "If uncertain, leave field as empty string (or null for publication_year).",
             "If the year is roman numerals (e.g., MDCCLXV), return it as an integer year.",
             "Prefer the first/main author name on the title page.",
             "Publisher/imprint is the printer/publisher line (often begins with 'Printed for', 'Chez', 'Verlag', 'Apud', etc.).",
-            "publication_place is the place name if present (e.g., London, Paris, Leipzig).",
-            "language must be one of: English, French, German, Latin, Other/Unknown."
+            "Publication statement (verbatim) should preserve the imprint line and year as printed on the title page as closely as possible.",
+            "Translator should be extracted if the title page states the work was translated by someone.",
+            "Illustration note should capture phrases such as 'with engravings', 'mit kupfern', 'with plates', or similar.",
+            "Correct obvious OCR character errors where meaning is clear, but do not invent missing facts.",
+            "language must be one of: English, French, German, Latin, Other/Unknown.",
+            "Return evidence snippets for title, author, publication place, publisher and publication year using the OCR text and/or visible page text."
         ],
         "required_json_schema": {
             "language": "English|French|German|Latin|Other/Unknown",
@@ -283,7 +279,17 @@ def llm_parse_title_page(ocr_text: str) -> Dict[str, Any]:
             "publisher": "string",
             "publication_year": "integer|null",
             "edition_statement": "string",
-            "llm_confidence": "number 0..1"
+            "publication_statement_verbatim": "string",
+            "translator": "string",
+            "illustration_note": "string",
+            "llm_confidence": "number 0..1",
+            "evidence": {
+                "title": "string",
+                "author": "string",
+                "publication_place": "string",
+                "publisher": "string",
+                "publication_year": "string"
+            }
         }
     }
 
@@ -292,7 +298,13 @@ def llm_parse_title_page(ocr_text: str) -> Dict[str, Any]:
         temperature=0,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user_obj, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(user_text, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ],
+            },
         ],
         response_format={"type": "json_object"},
     )
@@ -307,11 +319,23 @@ def llm_parse_title_page(ocr_text: str) -> Dict[str, Any]:
     parsed["llm_confidence"] = clamp01(parsed.get("llm_confidence"))
     parsed["publication_year"] = coerce_year(parsed.get("publication_year"))
 
-    for k in ["title", "author", "publication_place", "publisher", "edition_statement"]:
+    for k in [
+        "title",
+        "author",
+        "publication_place",
+        "publisher",
+        "edition_statement",
+        "publication_statement_verbatim",
+        "translator",
+        "illustration_note"
+    ]:
         if k not in parsed or parsed[k] is None:
             parsed[k] = ""
         else:
             parsed[k] = str(parsed[k]).strip()
+
+    if "evidence" not in parsed or parsed["evidence"] is None:
+        parsed["evidence"] = {}
 
     return parsed
 
@@ -343,10 +367,13 @@ async def extract(req: Request, body: ExtractRequest):
     # 3) OCR
     ocr_text, ocr_conf = run_ocr_document_text(image_bytes)
 
-    # 4) LLM parse
-    parsed = llm_parse_title_page(ocr_text)
+    # 4) LLM parse using OCR text + image URL
+    try:
+        parsed = llm_parse_title_page(ocr_text, body.image_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM parsing failed: {str(e)}")
 
-    # 5) Return combined payload (Airtable script will write fields)
+    # 5) Return combined payload
     return {
         "record_id": body.record_id,
         "ocr_text": ocr_text,
@@ -360,6 +387,11 @@ async def extract(req: Request, body: ExtractRequest):
         "publisher": parsed.get("publisher", ""),
         "publication_year": parsed.get("publication_year", None),
         "edition_statement": parsed.get("edition_statement", ""),
+        "publication_statement_verbatim": parsed.get("publication_statement_verbatim", ""),
+        "translator": parsed.get("translator", ""),
+        "illustration_note": parsed.get("illustration_note", ""),
+        "ocr_length": len(ocr_text),
+        "extraction_evidence_json": json.dumps(parsed.get("evidence", {}), ensure_ascii=False),
 
         "debug": {
             "downloaded_image_bytes": len(image_bytes),
@@ -368,5 +400,6 @@ async def extract(req: Request, body: ExtractRequest):
             "model": OPENAI_MODEL,
             "ocr_chars_sent_to_llm": min(len(ocr_text), MAX_OCR_CHARS_FOR_LLM),
             "orientation_action": orientation_action,
+            "image_sent_to_llm": True,
         }
     }
