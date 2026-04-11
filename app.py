@@ -18,17 +18,11 @@ from openai import OpenAI
 # -----------------------------
 # Environment variables required
 # -----------------------------
-# Airtable -> Render auth
 API_KEY = os.getenv("API_KEY", "")
-
-# Google Vision credentials (paste full JSON into this env var)
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
-
-# OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-# Optional tuning
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "90"))
 MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 
@@ -36,7 +30,7 @@ MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="RB Extractor", version="1.4.0")
+app = FastAPI(title="RB Extractor", version="1.5.0-verifier")
 
 
 # -----------------------------
@@ -71,9 +65,7 @@ def require_bearer_auth(req: Request) -> None:
 def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
     """
     Reads EXIF orientation data and rotates the image if necessary.
-    Returns:
-      - corrected image bytes
-      - orientation action string for debug
+    Returns corrected image bytes and orientation action string.
     """
     try:
         image = Image.open(io.BytesIO(image_bytes))
@@ -105,7 +97,6 @@ def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
             orientation_action = "no_exif"
 
         output = io.BytesIO()
-
         fmt = image.format if image.format in ["JPEG", "PNG"] else "JPEG"
         if fmt == "JPEG" and image.mode in ("RGBA", "P"):
             image = image.convert("RGB")
@@ -161,7 +152,7 @@ def run_ocr_document_text(image_bytes: bytes) -> Tuple[str, float]:
 
 
 # -----------------------------
-# Roman numeral parsing (best effort)
+# Roman numeral parsing
 # -----------------------------
 _ROMAN_MAP = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
 
@@ -199,13 +190,11 @@ def coerce_year(value: Any) -> Optional[int]:
         return iv if 1400 <= iv <= 2026 else None
 
     s = str(value).strip()
-
     m = re.search(r"\b(1[4-9]\d{2}|20[0-2]\d)\b", s)
     if m:
         return int(m.group(1))
 
-    r = roman_to_int(s)
-    return r
+    return roman_to_int(s)
 
 
 def normalize_language(lang: Any) -> str:
@@ -271,7 +260,7 @@ def normalize_parsed_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# OpenAI parsing (OCR text + image)
+# OpenAI extraction pass
 # -----------------------------
 def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
@@ -366,9 +355,94 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
     try:
         parsed = json.loads(content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse LLM JSON: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse extraction JSON: {str(e)}")
 
     return normalize_parsed_output(parsed)
+
+
+# -----------------------------
+# OpenAI verification pass
+# -----------------------------
+def verify_title_page_extraction(
+    ocr_text: str,
+    image_url: str,
+    draft: Dict[str, Any]
+) -> Dict[str, Any]:
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY env var not set on server")
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    text = ocr_text.strip()
+    if len(text) > MAX_OCR_CHARS_FOR_LLM:
+        text = text[:MAX_OCR_CHARS_FOR_LLM]
+
+    system = (
+        "You are an expert rare-books cataloguer performing verification of a previously extracted bibliographic record. "
+        "Your job is to check whether each extracted field is actually supported by the OCR text and the title page image. "
+        "Be conservative. If a field is weakly supported or wrong, correct it or blank it out. "
+        "Return STRICT JSON only. No markdown. No explanation."
+    )
+
+    user_text = {
+        "task": "Verify and correct extracted bibliographic metadata for a rare book title page.",
+        "ocr_text": text,
+        "draft_extraction": draft,
+        "verification_rules": [
+            "Only keep values supported by the OCR text or visible title page image.",
+            "Correct obvious OCR-driven mistakes if the intended reading is clear.",
+            "If publication_year is uncertain, return null.",
+            "If publication_place is uncertain, return empty string.",
+            "If publisher/imprint is uncertain, return empty string.",
+            "Preserve publication_statement_verbatim as closely as possible to the printed imprint line.",
+            "Return evidence snippets for title, author, publication_place, publisher, and publication_year.",
+            "Adjust llm_confidence downward if any key field is uncertain or weakly supported."
+        ],
+        "required_json_schema": {
+            "language": "English|French|German|Latin|Other/Unknown",
+            "title": "string",
+            "author": "string",
+            "publication_place": "string",
+            "publisher": "string",
+            "publication_year": "integer|null",
+            "edition_statement": "string",
+            "publication_statement_verbatim": "string",
+            "translator": "string",
+            "illustration_note": "string",
+            "llm_confidence": "number 0..1",
+            "evidence": {
+                "title": "string",
+                "author": "string",
+                "publication_place": "string",
+                "publisher": "string",
+                "publication_year": "string"
+            }
+        }
+    }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(user_text, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ],
+            },
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    content = resp.choices[0].message.content
+    try:
+        verified = json.loads(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse verification JSON: {str(e)}")
+
+    return normalize_parsed_output(verified)
 
 
 # -----------------------------
@@ -376,7 +450,7 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
 # -----------------------------
 @app.get("/")
 def health():
-    return {"status": "ok", "version": "1.4.0-prompt-upgrade"}
+    return {"status": "ok", "version": "1.5.0-verifier"}
 
 
 @app.post("/extract")
@@ -398,32 +472,38 @@ async def extract(req: Request, body: ExtractRequest):
     # 3) OCR
     ocr_text, ocr_conf = run_ocr_document_text(image_bytes)
 
-    # 4) LLM parse using OCR text + image URL
+    # 4) First-pass extraction
     try:
-        parsed = llm_parse_title_page(ocr_text, body.image_url)
+        first_pass = llm_parse_title_page(ocr_text, body.image_url)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM parsing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LLM extraction failed: {str(e)}")
 
-    # 5) Return combined payload
+    # 5) Second-pass verification
+    try:
+        final_pass = verify_title_page_extraction(ocr_text, body.image_url, first_pass)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM verification failed: {str(e)}")
+
+    # 6) Return verified payload
     return {
         "record_id": body.record_id,
-        "app_version": "1.4.0-prompt-upgrade",
+        "app_version": "1.5.0-verifier",
         "ocr_text": ocr_text,
         "ocr_confidence": float(ocr_conf),
-        "llm_confidence": float(parsed.get("llm_confidence", 0.0)),
-        "language": parsed.get("language", "Other/Unknown"),
+        "llm_confidence": float(final_pass.get("llm_confidence", 0.0)),
+        "language": final_pass.get("language", "Other/Unknown"),
 
-        "title": parsed.get("title", ""),
-        "author": parsed.get("author", ""),
-        "publication_place": parsed.get("publication_place", ""),
-        "publisher": parsed.get("publisher", ""),
-        "publication_year": parsed.get("publication_year", None),
-        "edition_statement": parsed.get("edition_statement", ""),
-        "publication_statement_verbatim": parsed.get("publication_statement_verbatim", ""),
-        "translator": parsed.get("translator", ""),
-        "illustration_note": parsed.get("illustration_note", ""),
+        "title": final_pass.get("title", ""),
+        "author": final_pass.get("author", ""),
+        "publication_place": final_pass.get("publication_place", ""),
+        "publisher": final_pass.get("publisher", ""),
+        "publication_year": final_pass.get("publication_year", None),
+        "edition_statement": final_pass.get("edition_statement", ""),
+        "publication_statement_verbatim": final_pass.get("publication_statement_verbatim", ""),
+        "translator": final_pass.get("translator", ""),
+        "illustration_note": final_pass.get("illustration_note", ""),
         "ocr_length": len(ocr_text),
-        "extraction_evidence_json": json.dumps(parsed.get("evidence", {}), ensure_ascii=False),
+        "extraction_evidence_json": json.dumps(final_pass.get("evidence", {}), ensure_ascii=False),
 
         "debug": {
             "downloaded_image_bytes": len(image_bytes),
@@ -433,6 +513,8 @@ async def extract(req: Request, body: ExtractRequest):
             "ocr_chars_sent_to_llm": min(len(ocr_text), MAX_OCR_CHARS_FOR_LLM),
             "orientation_action": orientation_action,
             "image_sent_to_llm": True,
-            "ocr_preview": ocr_text[:300]
+            "ocr_preview": ocr_text[:300],
+            "first_pass_llm_confidence": float(first_pass.get("llm_confidence", 0.0)),
+            "second_pass_verifier_used": True
         }
     }
