@@ -36,7 +36,7 @@ MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="RB Extractor", version="1.3.0")
+app = FastAPI(title="RB Extractor", version="1.4.0")
 
 
 # -----------------------------
@@ -235,6 +235,41 @@ def clamp01(x: Any) -> float:
     return max(0.0, min(1.0, v))
 
 
+def normalize_parsed_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    parsed["language"] = normalize_language(parsed.get("language"))
+    parsed["llm_confidence"] = clamp01(parsed.get("llm_confidence"))
+    parsed["publication_year"] = coerce_year(parsed.get("publication_year"))
+
+    text_fields = [
+        "title",
+        "author",
+        "publication_place",
+        "publisher",
+        "edition_statement",
+        "publication_statement_verbatim",
+        "translator",
+        "illustration_note"
+    ]
+
+    for k in text_fields:
+        if k not in parsed or parsed[k] is None:
+            parsed[k] = ""
+        else:
+            parsed[k] = str(parsed[k]).strip()
+
+    if "evidence" not in parsed or parsed["evidence"] is None or not isinstance(parsed["evidence"], dict):
+        parsed["evidence"] = {}
+
+    evidence_fields = ["title", "author", "publication_place", "publisher", "publication_year"]
+    for k in evidence_fields:
+        if k not in parsed["evidence"] or parsed["evidence"][k] is None:
+            parsed["evidence"][k] = ""
+        else:
+            parsed["evidence"][k] = str(parsed["evidence"][k]).strip()
+
+    return parsed
+
+
 # -----------------------------
 # OpenAI parsing (OCR text + image)
 # -----------------------------
@@ -249,28 +284,46 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
         text = text[:MAX_OCR_CHARS_FOR_LLM]
 
     system = (
-        "You are a careful rare-books cataloguer. "
-        "You extract bibliographic metadata from a rare book title page using BOTH the OCR text and the image itself. "
-        "Use the image to interpret layout, line grouping, imprint position, emphasis and details that OCR may miss. "
+        "You are an expert rare-books cataloguer working from a title page image and OCR text. "
+        "Your job is to extract bibliographic metadata accurately and conservatively. "
+        "Use BOTH the image and OCR text. The image is important because OCR may lose layout, line grouping, emphasis, and the exact position of imprint lines. "
+        "Treat this as a title page of an antiquarian or historical printed book. "
+        "Prioritise bibliographic accuracy over completeness. "
         "Return STRICT JSON only. No markdown. No explanation."
     )
 
     user_text = {
-        "task": "Extract bibliographic metadata from a rare book title page using the OCR text and the title page image.",
-        "ocr_text": text,
-        "output_rules": [
+        "task": "Extract bibliographic metadata from this rare book title page.",
+        "inputs": {
+            "ocr_text": text,
+            "image_role": "Use the image to understand layout, hierarchy, emphasis, and the lower imprint block."
+        },
+        "cataloguing_rules": [
             "Do not invent details not supported by the OCR text or visible image.",
-            "If uncertain, leave field as empty string (or null for publication_year).",
-            "If the year is roman numerals (e.g., MDCCLXV), return it as an integer year.",
-            "Prefer the first/main author name on the title page.",
-            "Publisher/imprint is the printer/publisher line (often begins with 'Printed for', 'Chez', 'Verlag', 'Apud', etc.).",
-            "Publication statement (verbatim) should preserve the imprint line and year as printed on the title page as closely as possible.",
-            "Translator should be extracted if the title page states the work was translated by someone.",
-            "Illustration note should capture phrases such as 'with engravings', 'mit kupfern', 'with plates', or similar.",
-            "Correct obvious OCR character errors where meaning is clear, but do not invent missing facts.",
-            "language must be one of: English, French, German, Latin, Other/Unknown.",
-            "Return evidence snippets for title, author, publication place, publisher and publication year using the OCR text and/or visible page text."
+            "If uncertain, leave a field as empty string, or null for publication_year.",
+            "If a year appears in Roman numerals, convert it to an integer year.",
+            "Preserve the imprint/publication statement as closely as possible in publication_statement_verbatim.",
+            "Correct obvious OCR mistakes where meaning is clear, but do not guess missing words.",
+            "Title is usually the largest or most prominent central text.",
+            "Author is often introduced by words such as BY, PAR, VON, APUD, or equivalent contextual placement.",
+            "Publisher/imprint is usually in the lower block of the page.",
+            "Publication place often appears immediately before or within the imprint block.",
+            "Edition statement often appears above the imprint line.",
+            "Translator should be extracted only if the page explicitly states that the work was translated by someone.",
+            "Illustration note should capture references to plates, engravings, profiles, figures, Kupfern, etc.",
+            "Language must be one of: English, French, German, Latin, Other/Unknown."
         ],
+        "field_guidance": {
+            "title": "Main work title only, normalised for obvious OCR errors.",
+            "author": "Main named author only, not translator/editor unless clearly the main author.",
+            "publication_place": "City/place of publication if explicitly shown.",
+            "publisher": "Printer, bookseller, publisher, or imprint entity.",
+            "publication_year": "Integer year only, converted from Roman numerals if needed.",
+            "edition_statement": "Edition wording or format statement such as Fifth Edition, revised edition, etc.",
+            "publication_statement_verbatim": "The imprint/publication statement as printed, preserved as closely as possible.",
+            "translator": "Named translator if explicitly stated.",
+            "illustration_note": "Any explicit reference to plates, engravings, profiles, figures, Kupfern, etc."
+        },
         "required_json_schema": {
             "language": "English|French|German|Latin|Other/Unknown",
             "title": "string",
@@ -315,29 +368,7 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse LLM JSON: {str(e)}")
 
-    parsed["language"] = normalize_language(parsed.get("language"))
-    parsed["llm_confidence"] = clamp01(parsed.get("llm_confidence"))
-    parsed["publication_year"] = coerce_year(parsed.get("publication_year"))
-
-    for k in [
-        "title",
-        "author",
-        "publication_place",
-        "publisher",
-        "edition_statement",
-        "publication_statement_verbatim",
-        "translator",
-        "illustration_note"
-    ]:
-        if k not in parsed or parsed[k] is None:
-            parsed[k] = ""
-        else:
-            parsed[k] = str(parsed[k]).strip()
-
-    if "evidence" not in parsed or parsed["evidence"] is None:
-        parsed["evidence"] = {}
-
-    return parsed
+    return normalize_parsed_output(parsed)
 
 
 # -----------------------------
@@ -345,7 +376,7 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
 # -----------------------------
 @app.get("/")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "1.4.0-prompt-upgrade"}
 
 
 @app.post("/extract")
@@ -376,6 +407,7 @@ async def extract(req: Request, body: ExtractRequest):
     # 5) Return combined payload
     return {
         "record_id": body.record_id,
+        "app_version": "1.4.0-prompt-upgrade",
         "ocr_text": ocr_text,
         "ocr_confidence": float(ocr_conf),
         "llm_confidence": float(parsed.get("llm_confidence", 0.0)),
@@ -401,5 +433,6 @@ async def extract(req: Request, body: ExtractRequest):
             "ocr_chars_sent_to_llm": min(len(ocr_text), MAX_OCR_CHARS_FOR_LLM),
             "orientation_action": orientation_action,
             "image_sent_to_llm": True,
+            "ocr_preview": ocr_text[:300]
         }
     }
