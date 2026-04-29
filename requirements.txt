@@ -6,3 +6,4 @@ google-cloud-vision
 google-auth
 openai
 Pillow
+google-cloud-storage
