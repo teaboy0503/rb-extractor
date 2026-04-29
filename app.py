@@ -3,21 +3,20 @@ import io
 import os
 import json
 import re
+from datetime import timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from google.cloud import storage
 from google.cloud import vision
 from google.oauth2 import service_account
 
 from openai import OpenAI
 
 
-# -----------------------------
-# Environment variables required
-# -----------------------------
 API_KEY = os.getenv("API_KEY", "")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -26,26 +25,18 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "90"))
 MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 
-
-# -----------------------------
-# FastAPI app
-# -----------------------------
-app = FastAPI(title="RB Extractor", version="1.5.0-verifier")
+app = FastAPI(title="RB Extractor", version="1.6.0-gcs")
 
 
-# -----------------------------
-# Request model
-# -----------------------------
 class ExtractRequest(BaseModel):
     record_id: str
-    image_url: str
+    image_url: Optional[str] = None
+    gcs_bucket: Optional[str] = None
+    gcs_object_path: Optional[str] = None
     item_id: Optional[str] = None
     collection: Optional[str] = None
 
 
-# -----------------------------
-# Auth
-# -----------------------------
 def require_bearer_auth(req: Request) -> None:
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API_KEY env var not set on server")
@@ -59,14 +50,55 @@ def require_bearer_auth(req: Request) -> None:
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
-# -----------------------------
-# Image orientation correction
-# -----------------------------
+def get_google_credentials():
+    if not GOOGLE_CREDENTIALS_JSON:
+        raise HTTPException(status_code=500, detail="GOOGLE_CREDENTIALS_JSON env var not set on server")
+
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        credentials = service_account.Credentials.from_service_account_info(creds_dict)
+        return credentials, creds_dict.get("project_id")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load Google credentials: {str(e)}")
+
+
+def get_storage_client() -> storage.Client:
+    credentials, project_id = get_google_credentials()
+    return storage.Client(credentials=credentials, project=project_id)
+
+
+def download_gcs_bytes(bucket_name: str, object_path: str) -> bytes:
+    try:
+        client = get_storage_client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_path)
+
+        if not blob.exists():
+            raise HTTPException(status_code=404, detail=f"GCS object not found: gs://{bucket_name}/{object_path}")
+
+        return blob.download_as_bytes()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download from GCS: {str(e)}")
+
+
+def generate_gcs_signed_url(bucket_name: str, object_path: str) -> str:
+    try:
+        client = get_storage_client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_path)
+
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(hours=2),
+            method="GET",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create signed GCS URL: {str(e)}")
+
+
 def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
-    """
-    Reads EXIF orientation data and rotates the image if necessary.
-    Returns corrected image bytes and orientation action string.
-    """
     try:
         image = Image.open(io.BytesIO(image_bytes))
         orientation_tag = None
@@ -77,8 +109,8 @@ def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
                 break
 
         orientation_action = "none"
-
         exif = image._getexif()
+
         if exif is not None and orientation_tag is not None:
             orientation_value = exif.get(orientation_tag)
 
@@ -98,6 +130,7 @@ def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
 
         output = io.BytesIO()
         fmt = image.format if image.format in ["JPEG", "PNG"] else "JPEG"
+
         if fmt == "JPEG" and image.mode in ("RGBA", "P"):
             image = image.convert("RGB")
 
@@ -108,26 +141,15 @@ def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
         return image_bytes, f"orientation_fix_failed:{str(e)}"
 
 
-# -----------------------------
-# Google Vision OCR
-# -----------------------------
 def get_vision_client() -> vision.ImageAnnotatorClient:
-    if not GOOGLE_CREDENTIALS_JSON:
-        raise HTTPException(status_code=500, detail="GOOGLE_CREDENTIALS_JSON env var not set on server")
-
     try:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        credentials = service_account.Credentials.from_service_account_info(creds_dict)
+        credentials, _ = get_google_credentials()
         return vision.ImageAnnotatorClient(credentials=credentials)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to init Vision client: {str(e)}")
 
 
 def run_ocr_document_text(image_bytes: bytes) -> Tuple[str, float]:
-    """
-    Uses document_text_detection (best for scanned pages / dense text).
-    Returns (full_text, avg_word_confidence).
-    """
     client = get_vision_client()
     img = vision.Image(content=image_bytes)
     resp = client.document_text_detection(image=img)
@@ -151,23 +173,24 @@ def run_ocr_document_text(image_bytes: bytes) -> Tuple[str, float]:
     return full_text, float(avg_conf)
 
 
-# -----------------------------
-# Roman numeral parsing
-# -----------------------------
 _ROMAN_MAP = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+
 
 def roman_to_int(s: str) -> Optional[int]:
     if not s:
         return None
+
     s = re.sub(r"[^IVXLCDM]", "", s.upper())
     if len(s) < 3:
         return None
 
     total = 0
     prev = 0
+
     for ch in reversed(s):
         if ch not in _ROMAN_MAP:
             return None
+
         val = _ROMAN_MAP[ch]
         if val < prev:
             total -= val
@@ -175,22 +198,23 @@ def roman_to_int(s: str) -> Optional[int]:
             total += val
             prev = val
 
-    if 1400 <= total <= 2026:
-        return total
-    return None
+    return total if 1400 <= total <= 2026 else None
 
 
 def coerce_year(value: Any) -> Optional[int]:
     if value is None:
         return None
+
     if isinstance(value, int):
         return value if 1400 <= value <= 2026 else None
+
     if isinstance(value, float) and value.is_integer():
         iv = int(value)
         return iv if 1400 <= iv <= 2026 else None
 
     s = str(value).strip()
     m = re.search(r"\b(1[4-9]\d{2}|20[0-2]\d)\b", s)
+
     if m:
         return int(m.group(1))
 
@@ -199,12 +223,16 @@ def coerce_year(value: Any) -> Optional[int]:
 
 def normalize_language(lang: Any) -> str:
     allowed = {"English", "French", "German", "Latin", "Other/Unknown"}
+
     if not lang:
         return "Other/Unknown"
+
     s = str(lang).strip()
     if s in allowed:
         return s
+
     low = s.lower()
+
     if "french" in low or "français" in low:
         return "French"
     if "german" in low or "deutsch" in low:
@@ -213,6 +241,7 @@ def normalize_language(lang: Any) -> str:
         return "Latin"
     if "english" in low:
         return "English"
+
     return "Other/Unknown"
 
 
@@ -221,6 +250,7 @@ def clamp01(x: Any) -> float:
         v = float(x)
     except Exception:
         return 0.0
+
     return max(0.0, min(1.0, v))
 
 
@@ -237,31 +267,21 @@ def normalize_parsed_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "edition_statement",
         "publication_statement_verbatim",
         "translator",
-        "illustration_note"
+        "illustration_note",
     ]
 
     for k in text_fields:
-        if k not in parsed or parsed[k] is None:
-            parsed[k] = ""
-        else:
-            parsed[k] = str(parsed[k]).strip()
+        parsed[k] = "" if parsed.get(k) is None else str(parsed.get(k, "")).strip()
 
     if "evidence" not in parsed or parsed["evidence"] is None or not isinstance(parsed["evidence"], dict):
         parsed["evidence"] = {}
 
-    evidence_fields = ["title", "author", "publication_place", "publisher", "publication_year"]
-    for k in evidence_fields:
-        if k not in parsed["evidence"] or parsed["evidence"][k] is None:
-            parsed["evidence"][k] = ""
-        else:
-            parsed["evidence"][k] = str(parsed["evidence"][k]).strip()
+    for k in ["title", "author", "publication_place", "publisher", "publication_year"]:
+        parsed["evidence"][k] = "" if parsed["evidence"].get(k) is None else str(parsed["evidence"].get(k, "")).strip()
 
     return parsed
 
 
-# -----------------------------
-# OpenAI extraction pass
-# -----------------------------
 def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY env var not set on server")
@@ -274,10 +294,8 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
 
     system = (
         "You are an expert rare-books cataloguer working from a title page image and OCR text. "
-        "Your job is to extract bibliographic metadata accurately and conservatively. "
-        "Use BOTH the image and OCR text. The image is important because OCR may lose layout, line grouping, emphasis, and the exact position of imprint lines. "
-        "Treat this as a title page of an antiquarian or historical printed book. "
-        "Prioritise bibliographic accuracy over completeness. "
+        "Extract bibliographic metadata accurately and conservatively. "
+        "Use BOTH the image and OCR text. "
         "Return STRICT JSON only. No markdown. No explanation."
     )
 
@@ -285,34 +303,19 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
         "task": "Extract bibliographic metadata from this rare book title page.",
         "inputs": {
             "ocr_text": text,
-            "image_role": "Use the image to understand layout, hierarchy, emphasis, and the lower imprint block."
+            "image_role": "Use the image to understand layout, hierarchy, emphasis, and the lower imprint block.",
         },
         "cataloguing_rules": [
-            "Do not invent details not supported by the OCR text or visible image.",
-            "If uncertain, leave a field as empty string, or null for publication_year.",
-            "If a year appears in Roman numerals, convert it to an integer year.",
-            "Preserve the imprint/publication statement as closely as possible in publication_statement_verbatim.",
-            "Correct obvious OCR mistakes where meaning is clear, but do not guess missing words.",
-            "Title is usually the largest or most prominent central text.",
-            "Author is often introduced by words such as BY, PAR, VON, APUD, or equivalent contextual placement.",
-            "Publisher/imprint is usually in the lower block of the page.",
-            "Publication place often appears immediately before or within the imprint block.",
-            "Edition statement often appears above the imprint line.",
-            "Translator should be extracted only if the page explicitly states that the work was translated by someone.",
+            "Do not invent details not supported by OCR or image.",
+            "If uncertain, leave a field empty, or null for publication_year.",
+            "If year is Roman numerals, convert to integer.",
+            "Preserve imprint/publication statement in publication_statement_verbatim.",
+            "Title is usually the largest central text.",
+            "Publisher/imprint is usually in the lower block.",
+            "Translator only if explicitly stated.",
             "Illustration note should capture references to plates, engravings, profiles, figures, Kupfern, etc.",
-            "Language must be one of: English, French, German, Latin, Other/Unknown."
+            "Language must be one of: English, French, German, Latin, Other/Unknown.",
         ],
-        "field_guidance": {
-            "title": "Main work title only, normalised for obvious OCR errors.",
-            "author": "Main named author only, not translator/editor unless clearly the main author.",
-            "publication_place": "City/place of publication if explicitly shown.",
-            "publisher": "Printer, bookseller, publisher, or imprint entity.",
-            "publication_year": "Integer year only, converted from Roman numerals if needed.",
-            "edition_statement": "Edition wording or format statement such as Fifth Edition, revised edition, etc.",
-            "publication_statement_verbatim": "The imprint/publication statement as printed, preserved as closely as possible.",
-            "translator": "Named translator if explicitly stated.",
-            "illustration_note": "Any explicit reference to plates, engravings, profiles, figures, Kupfern, etc."
-        },
         "required_json_schema": {
             "language": "English|French|German|Latin|Other/Unknown",
             "title": "string",
@@ -330,9 +333,9 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
                 "author": "string",
                 "publication_place": "string",
                 "publisher": "string",
-                "publication_year": "string"
-            }
-        }
+                "publication_year": "string",
+            },
+        },
     }
 
     resp = client.chat.completions.create(
@@ -344,30 +347,22 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": json.dumps(user_text, ensure_ascii=False)},
-                    {"type": "image_url", "image_url": {"url": image_url}}
+                    {"type": "image_url", "image_url": {"url": image_url}},
                 ],
             },
         ],
         response_format={"type": "json_object"},
     )
 
-    content = resp.choices[0].message.content
     try:
-        parsed = json.loads(content)
+        parsed = json.loads(resp.choices[0].message.content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse extraction JSON: {str(e)}")
 
     return normalize_parsed_output(parsed)
 
 
-# -----------------------------
-# OpenAI verification pass
-# -----------------------------
-def verify_title_page_extraction(
-    ocr_text: str,
-    image_url: str,
-    draft: Dict[str, Any]
-) -> Dict[str, Any]:
+def verify_title_page_extraction(ocr_text: str, image_url: str, draft: Dict[str, Any]) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY env var not set on server")
 
@@ -378,25 +373,21 @@ def verify_title_page_extraction(
         text = text[:MAX_OCR_CHARS_FOR_LLM]
 
     system = (
-        "You are an expert rare-books cataloguer performing verification of a previously extracted bibliographic record. "
-        "Your job is to check whether each extracted field is actually supported by the OCR text and the title page image. "
-        "Be conservative. If a field is weakly supported or wrong, correct it or blank it out. "
+        "You are an expert rare-books cataloguer verifying extracted bibliographic metadata. "
+        "Check each field against OCR and image. Correct or blank unsupported values. "
         "Return STRICT JSON only. No markdown. No explanation."
     )
 
     user_text = {
-        "task": "Verify and correct extracted bibliographic metadata for a rare book title page.",
+        "task": "Verify and correct extracted bibliographic metadata.",
         "ocr_text": text,
         "draft_extraction": draft,
         "verification_rules": [
-            "Only keep values supported by the OCR text or visible title page image.",
-            "Correct obvious OCR-driven mistakes if the intended reading is clear.",
+            "Only keep values supported by OCR or image.",
             "If publication_year is uncertain, return null.",
-            "If publication_place is uncertain, return empty string.",
-            "If publisher/imprint is uncertain, return empty string.",
-            "Preserve publication_statement_verbatim as closely as possible to the printed imprint line.",
-            "Return evidence snippets for title, author, publication_place, publisher, and publication_year.",
-            "Adjust llm_confidence downward if any key field is uncertain or weakly supported."
+            "If publication_place or publisher is uncertain, return empty string.",
+            "Preserve publication_statement_verbatim close to printed imprint.",
+            "Adjust llm_confidence downward if key fields are uncertain.",
         ],
         "required_json_schema": {
             "language": "English|French|German|Latin|Other/Unknown",
@@ -415,9 +406,9 @@ def verify_title_page_extraction(
                 "author": "string",
                 "publication_place": "string",
                 "publisher": "string",
-                "publication_year": "string"
-            }
-        }
+                "publication_year": "string",
+            },
+        },
     }
 
     resp = client.chat.completions.create(
@@ -429,65 +420,73 @@ def verify_title_page_extraction(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": json.dumps(user_text, ensure_ascii=False)},
-                    {"type": "image_url", "image_url": {"url": image_url}}
+                    {"type": "image_url", "image_url": {"url": image_url}},
                 ],
             },
         ],
         response_format={"type": "json_object"},
     )
 
-    content = resp.choices[0].message.content
     try:
-        verified = json.loads(content)
+        verified = json.loads(resp.choices[0].message.content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse verification JSON: {str(e)}")
 
     return normalize_parsed_output(verified)
 
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.get("/")
 def health():
-    return {"status": "ok", "version": "1.5.0-verifier"}
+    return {"status": "ok", "version": "1.6.0-gcs"}
 
 
 @app.post("/extract")
 async def extract(req: Request, body: ExtractRequest):
     require_bearer_auth(req)
 
-    # 1) Download image bytes
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
-            r = await client.get(body.image_url)
-            r.raise_for_status()
-            image_bytes = r.content
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download image: {str(e)}")
+    if body.gcs_bucket and body.gcs_object_path:
+        image_bytes = download_gcs_bytes(body.gcs_bucket, body.gcs_object_path)
+        image_source = "gcs"
+        image_ref = f"gs://{body.gcs_bucket}/{body.gcs_object_path}"
+        openai_image_url = generate_gcs_signed_url(body.gcs_bucket, body.gcs_object_path)
 
-    # 2) Fix image orientation before OCR
+    elif body.image_url:
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
+                r = await client.get(body.image_url)
+                r.raise_for_status()
+                image_bytes = r.content
+
+            image_source = "url"
+            image_ref = body.image_url
+            openai_image_url = body.image_url
+
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download image: {str(e)}")
+
+    else:
+        raise HTTPException(status_code=400, detail="Provide either image_url or both gcs_bucket and gcs_object_path")
+
     image_bytes, orientation_action = fix_image_orientation(image_bytes)
 
-    # 3) OCR
     ocr_text, ocr_conf = run_ocr_document_text(image_bytes)
 
-    # 4) First-pass extraction
     try:
-        first_pass = llm_parse_title_page(ocr_text, body.image_url)
+        first_pass = llm_parse_title_page(ocr_text, openai_image_url)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM extraction failed: {str(e)}")
 
-    # 5) Second-pass verification
     try:
-        final_pass = verify_title_page_extraction(ocr_text, body.image_url, first_pass)
+        final_pass = verify_title_page_extraction(ocr_text, openai_image_url, first_pass)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM verification failed: {str(e)}")
 
-    # 6) Return verified payload
     return {
         "record_id": body.record_id,
-        "app_version": "1.5.0-verifier",
+        "app_version": "1.6.0-gcs",
+        "image_source": image_source,
+        "image_ref": image_ref,
+
         "ocr_text": ocr_text,
         "ocr_confidence": float(ocr_conf),
         "llm_confidence": float(final_pass.get("llm_confidence", 0.0)),
@@ -513,8 +512,9 @@ async def extract(req: Request, body: ExtractRequest):
             "ocr_chars_sent_to_llm": min(len(ocr_text), MAX_OCR_CHARS_FOR_LLM),
             "orientation_action": orientation_action,
             "image_sent_to_llm": True,
+            "openai_image_url_source": image_source,
             "ocr_preview": ocr_text[:300],
             "first_pass_llm_confidence": float(first_pass.get("llm_confidence", 0.0)),
-            "second_pass_verifier_used": True
-        }
+            "second_pass_verifier_used": True,
+        },
     }
