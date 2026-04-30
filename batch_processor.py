@@ -9,9 +9,6 @@ from google.cloud import storage
 from google.oauth2 import service_account
 
 
-# -----------------------------
-# Config via Render env vars
-# -----------------------------
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 BUCKET_NAME = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
@@ -26,31 +23,26 @@ EXTRACTOR_API_KEY = os.getenv("API_KEY", "")
 MAX_FILES = int(os.getenv("MAX_FILES", "3"))
 
 
-# -----------------------------
-# Google client
-# -----------------------------
 def get_storage_client():
     if not GOOGLE_CREDENTIALS_JSON:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var is missing")
 
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     credentials = service_account.Credentials.from_service_account_info(creds_dict)
-    return storage.Client(credentials=credentials, project=creds_dict.get("project_id"))
+
+    return storage.Client(
+        credentials=credentials,
+        project=creds_dict.get("project_id"),
+    )
 
 
 storage_client = get_storage_client()
 bucket = storage_client.bucket(BUCKET_NAME)
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def list_input_blobs():
     blobs = list(storage_client.list_blobs(BUCKET_NAME, prefix=INPUT_PREFIX))
-    return [
-        blob for blob in blobs
-        if not blob.name.endswith("/")
-    ][:MAX_FILES]
+    return [blob for blob in blobs if not blob.name.endswith("/")][:MAX_FILES]
 
 
 def call_extractor(blob_name):
@@ -62,7 +54,7 @@ def call_extractor(blob_name):
         "collection": "",
     }
 
-    resp = requests.post(
+    response = requests.post(
         EXTRACTOR_URL,
         headers={
             "Content-Type": "application/json",
@@ -72,10 +64,10 @@ def call_extractor(blob_name):
         timeout=180,
     )
 
-    if not resp.ok:
-        raise RuntimeError(f"Extractor error {resp.status_code}: {resp.text}")
+    if not response.ok:
+        raise RuntimeError(f"Extractor error {response.status_code}: {response.text}")
 
-    return resp.json()
+    return response.json()
 
 
 def move_blob(blob, destination_prefix):
@@ -95,8 +87,7 @@ def download_existing_results():
         return []
 
     content = blob.download_as_text(encoding="utf-8")
-    rows = list(csv.DictReader(content.splitlines()))
-    return rows
+    return list(csv.DictReader(content.splitlines()))
 
 
 def upload_results(rows):
@@ -106,17 +97,14 @@ def upload_results(rows):
         "final_gcs_path",
         "status",
         "error",
-
         "app_version",
         "image_source",
         "image_ref",
-
         "ocr_text",
         "ocr_confidence",
         "ocr_length",
         "llm_confidence",
         "language",
-
         "title",
         "author",
         "publication_place",
@@ -128,7 +116,6 @@ def upload_results(rows):
         "illustration_note",
         "extraction_evidence_json",
         "extraction_json",
-
         "GCS bucket",
         "GCS object path",
         "Original filename",
@@ -137,15 +124,15 @@ def upload_results(rows):
         "Extraction status",
     ]
 
-    with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", delete=False) as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", delete=False) as tmp:
+        writer = csv.DictWriter(tmp, fieldnames=fieldnames)
         writer.writeheader()
 
         for row in rows:
             safe_row = {key: row.get(key, "") for key in fieldnames}
             writer.writerow(safe_row)
 
-        temp_path = f.name
+        temp_path = tmp.name
 
     blob = bucket.blob(RESULTS_PATH)
     blob.upload_from_filename(temp_path, content_type="text/csv")
@@ -160,17 +147,14 @@ def result_row_success(source_path, final_path, data):
         "final_gcs_path": final_path,
         "status": "success",
         "error": "",
-
         "app_version": data.get("app_version", ""),
         "image_source": data.get("image_source", ""),
         "image_ref": data.get("image_ref", ""),
-
         "ocr_text": data.get("ocr_text", ""),
         "ocr_confidence": data.get("ocr_confidence", ""),
         "ocr_length": data.get("ocr_length", ""),
         "llm_confidence": data.get("llm_confidence", ""),
         "language": data.get("language", ""),
-
         "title": data.get("title", ""),
         "author": data.get("author", ""),
         "publication_place": data.get("publication_place", ""),
@@ -182,7 +166,6 @@ def result_row_success(source_path, final_path, data):
         "illustration_note": data.get("illustration_note", ""),
         "extraction_evidence_json": data.get("extraction_evidence_json", ""),
         "extraction_json": json.dumps(data, ensure_ascii=False),
-
         "GCS bucket": BUCKET_NAME,
         "GCS object path": final_path,
         "Original filename": filename,
@@ -201,7 +184,6 @@ def result_row_failed(source_path, final_path, error):
         "final_gcs_path": final_path,
         "status": "failed",
         "error": str(error),
-
         "GCS bucket": BUCKET_NAME,
         "GCS object path": final_path,
         "Original filename": filename,
@@ -211,9 +193,6 @@ def result_row_failed(source_path, final_path, error):
     }
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     print(f"Bucket: {BUCKET_NAME}")
     print(f"Input prefix: {INPUT_PREFIX}")
@@ -227,39 +206,42 @@ def main():
 
     rows = download_existing_results()
 
-    already_recorded = set()
+    already_successful = set()
     for row in rows:
         source = row.get("source_gcs_path", "").strip()
         status = row.get("status", "").strip().lower()
-    if source and status == "success":
-        already_recorded.add(source)
+
+        if source and status == "success":
+            already_successful.add(source)
+
     for blob in blobs:
         source_path = blob.name
-        
-        if source_path in already_recorded:
-            print(f"Skipping already recorded file: {source_path}")
+
+        if source_path in already_successful:
+            print(f"Skipping already successful file: {source_path}")
             continue
 
-            print(f"Processing: {source_path}")
+        print(f"Processing: {source_path}")
 
         try:
             data = call_extractor(source_path)
             final_path = move_blob(blob, PROCESSED_PREFIX)
+
             rows.append(result_row_success(source_path, final_path, data))
-            already_recorded.add(source_path)
+            already_successful.add(source_path)
             upload_results(rows)
+
             print(f"Success: {source_path} -> {final_path}")
 
-        except Exception as e:
-            print(f"Failed: {source_path}: {e}")
+        except Exception as error:
+            print(f"Failed: {source_path}: {error}")
 
             try:
                 final_path = move_blob(blob, FAILED_PREFIX)
             except Exception:
                 final_path = source_path
 
-            rows.append(result_row_failed(source_path, final_path, e))
-            already_recorded.add(source_path)
+            rows.append(result_row_failed(source_path, final_path, error))
             upload_results(rows)
 
     print(f"Done. Results written to gs://{BUCKET_NAME}/{RESULTS_PATH}")
