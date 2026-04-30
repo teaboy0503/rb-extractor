@@ -234,9 +234,10 @@ def main():
         already_recorded.add(source)
     for blob in blobs:
         source_path = blob.name
-            if source_path in already_recorded:
-                print(f"Skipping already recorded file: {source_path}")
-                continue
+        
+        if source_path in already_recorded:
+            print(f"Skipping already recorded file: {source_path}")
+            continue
 
             print(f"Processing: {source_path}")
 
