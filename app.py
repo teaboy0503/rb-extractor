@@ -129,11 +129,12 @@ def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
             orientation_action = "no_exif"
 
         output = io.BytesIO()
+        fmt = image.format if image.format in ["JPEG", "PNG"] else "JPEG"
 
-        if image.mode != "RGB":
+        if fmt == "JPEG" and image.mode in ("RGBA", "P", "CMYK"):
             image = image.convert("RGB")
 
-        image.save(output, format="JPEG", quality=90)
+        image.save(output, format=fmt)
         return output.getvalue(), orientation_action
 
     except Exception as e:
