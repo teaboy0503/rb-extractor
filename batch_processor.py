@@ -2,6 +2,7 @@ import os
 import csv
 import json
 import tempfile
+import time
 from datetime import datetime, UTC
 
 import requests
@@ -21,6 +22,7 @@ EXTRACTOR_URL = os.getenv("EXTRACTOR_URL", "https://rb-extractor.onrender.com/ex
 EXTRACTOR_API_KEY = os.getenv("API_KEY", "")
 
 MAX_FILES = int(os.getenv("MAX_FILES", "3"))
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1.5"))
 
 
 def get_storage_client():
@@ -29,11 +31,7 @@ def get_storage_client():
 
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     credentials = service_account.Credentials.from_service_account_info(creds_dict)
-
-    return storage.Client(
-        credentials=credentials,
-        project=creds_dict.get("project_id"),
-    )
+    return storage.Client(credentials=credentials, project=creds_dict.get("project_id"))
 
 
 storage_client = get_storage_client()
@@ -73,10 +71,8 @@ def call_extractor(blob_name):
 def move_blob(blob, destination_prefix):
     filename = blob.name.split("/")[-1]
     destination_name = f"{destination_prefix}{filename}"
-
     bucket.copy_blob(blob, bucket, destination_name)
     blob.delete()
-
     return destination_name
 
 
@@ -92,36 +88,14 @@ def download_existing_results():
 
 def upload_results(rows):
     fieldnames = [
-        "processed_at",
-        "source_gcs_path",
-        "final_gcs_path",
-        "status",
-        "error",
-        "app_version",
-        "image_source",
-        "image_ref",
-        "ocr_text",
-        "ocr_confidence",
-        "ocr_length",
-        "llm_confidence",
-        "language",
-        "title",
-        "author",
-        "publication_place",
-        "publisher",
-        "publication_year",
-        "edition_statement",
-        "publication_statement_verbatim",
-        "translator",
-        "illustration_note",
-        "extraction_evidence_json",
-        "extraction_json",
-        "GCS bucket",
-        "GCS object path",
-        "Original filename",
-        "Image source",
-        "Image format",
-        "Extraction status",
+        "processed_at", "source_gcs_path", "final_gcs_path", "status", "error",
+        "app_version", "image_source", "image_ref",
+        "ocr_text", "ocr_confidence", "ocr_length", "llm_confidence", "language",
+        "title", "author", "publication_place", "publisher", "publication_year",
+        "edition_statement", "publication_statement_verbatim", "translator",
+        "illustration_note", "extraction_evidence_json", "extraction_json",
+        "GCS bucket", "GCS object path", "Original filename", "Image source",
+        "Image format", "Extraction status",
     ]
 
     with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", delete=False) as tmp:
@@ -129,13 +103,11 @@ def upload_results(rows):
         writer.writeheader()
 
         for row in rows:
-            safe_row = {key: row.get(key, "") for key in fieldnames}
-            writer.writerow(safe_row)
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
 
         temp_path = tmp.name
 
-    blob = bucket.blob(RESULTS_PATH)
-    blob.upload_from_filename(temp_path, content_type="text/csv")
+    bucket.blob(RESULTS_PATH).upload_from_filename(temp_path, content_type="text/csv")
 
 
 def result_row_success(source_path, final_path, data):
@@ -197,6 +169,7 @@ def main():
     print(f"Bucket: {BUCKET_NAME}")
     print(f"Input prefix: {INPUT_PREFIX}")
     print(f"Max files: {MAX_FILES}")
+    print(f"Sleep seconds: {SLEEP_SECONDS}")
 
     blobs = list_input_blobs()
     print(f"Found {len(blobs)} file(s) to process")
@@ -243,6 +216,8 @@ def main():
 
             rows.append(result_row_failed(source_path, final_path, error))
             upload_results(rows)
+
+        time.sleep(SLEEP_SECONDS)
 
     print(f"Done. Results written to gs://{BUCKET_NAME}/{RESULTS_PATH}")
 
