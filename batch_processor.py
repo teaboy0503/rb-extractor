@@ -155,7 +155,7 @@ def result_row_success(source_path, final_path, data):
     filename = source_path.split("/")[-1]
 
     return {
-        "processed_at": datetime.utcnow().isoformat(),
+        "processed_at": datetime.now(UTC).isoformat(),
         "source_gcs_path": source_path,
         "final_gcs_path": final_path,
         "status": "success",
