@@ -2,7 +2,7 @@ import os
 import csv
 import json
 import tempfile
-from datetime import datetime
+from datetime import datetime, UTC
 
 import requests
 from google.cloud import storage
@@ -196,7 +196,7 @@ def result_row_failed(source_path, final_path, error):
     filename = source_path.split("/")[-1]
 
     return {
-        "processed_at": datetime.utcnow().isoformat(),
+        "processed_at": datetime.now(UTC).isoformat(),
         "source_gcs_path": source_path,
         "final_gcs_path": final_path,
         "status": "failed",
