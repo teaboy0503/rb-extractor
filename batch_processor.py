@@ -227,14 +227,24 @@ def main():
 
     rows = download_existing_results()
 
+    already_recorded = set()
+    for row in rows:
+        source = row.get("source_gcs_path", "").strip()
+    if source:
+        already_recorded.add(source)
     for blob in blobs:
         source_path = blob.name
-        print(f"Processing: {source_path}")
+            if source_path in already_recorded:
+                print(f"Skipping already recorded file: {source_path}")
+                continue
+
+            print(f"Processing: {source_path}")
 
         try:
             data = call_extractor(source_path)
             final_path = move_blob(blob, PROCESSED_PREFIX)
             rows.append(result_row_success(source_path, final_path, data))
+            already_recorded.add(source_path)
             upload_results(rows)
             print(f"Success: {source_path} -> {final_path}")
 
@@ -247,6 +257,7 @@ def main():
                 final_path = source_path
 
             rows.append(result_row_failed(source_path, final_path, e))
+            already_recorded.add(source_path)
             upload_results(rows)
 
     print(f"Done. Results written to gs://{BUCKET_NAME}/{RESULTS_PATH}")
