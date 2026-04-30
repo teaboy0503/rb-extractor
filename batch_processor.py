@@ -230,7 +230,8 @@ def main():
     already_recorded = set()
     for row in rows:
         source = row.get("source_gcs_path", "").strip()
-    if source:
+        status = row.get("status", "").strip().lower()
+    if source and status == "success":
         already_recorded.add(source)
     for blob in blobs:
         source_path = blob.name
