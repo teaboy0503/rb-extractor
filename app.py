@@ -470,6 +470,8 @@ async def extract(req: Request, body: ExtractRequest):
     image_bytes, orientation_action = fix_image_orientation(image_bytes)
 
     ocr_text, ocr_conf = run_ocr_document_text(image_bytes)
+    
+    del image_bytes
 
     try:
         first_pass = llm_parse_title_page(ocr_text, openai_image_url)
