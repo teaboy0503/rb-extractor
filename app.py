@@ -25,7 +25,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "90"))
 MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 
-app = FastAPI(title="RB Extractor", version="1.6.0-gcs")
+app = FastAPI(title="RB Extractor", version="1.6.1-gcs")
 
 
 class ExtractRequest(BaseModel):
@@ -129,12 +129,11 @@ def fix_image_orientation(image_bytes: bytes) -> Tuple[bytes, str]:
             orientation_action = "no_exif"
 
         output = io.BytesIO()
-        fmt = image.format if image.format in ["JPEG", "PNG"] else "JPEG"
 
-        if fmt == "JPEG" and image.mode in ("RGBA", "P"):
+        if image.mode != "RGB":
             image = image.convert("RGB")
 
-        image.save(output, format=fmt)
+        image.save(output, format="JPEG", quality=90)
         return output.getvalue(), orientation_action
 
     except Exception as e:
@@ -437,7 +436,7 @@ def verify_title_page_extraction(ocr_text: str, image_url: str, draft: Dict[str,
 
 @app.get("/")
 def health():
-    return {"status": "ok", "version": "1.6.0-gcs"}
+    return {"status": "ok", "version": "1.6.1-gcs"}
 
 
 @app.post("/extract")
@@ -469,8 +468,10 @@ async def extract(req: Request, body: ExtractRequest):
 
     image_bytes, orientation_action = fix_image_orientation(image_bytes)
 
+    downloaded_image_bytes = len(image_bytes)
+
     ocr_text, ocr_conf = run_ocr_document_text(image_bytes)
-    
+
     del image_bytes
 
     try:
@@ -485,15 +486,13 @@ async def extract(req: Request, body: ExtractRequest):
 
     return {
         "record_id": body.record_id,
-        "app_version": "1.6.0-gcs",
+        "app_version": "1.6.1-gcs",
         "image_source": image_source,
         "image_ref": image_ref,
-
         "ocr_text": ocr_text,
         "ocr_confidence": float(ocr_conf),
         "llm_confidence": float(final_pass.get("llm_confidence", 0.0)),
         "language": final_pass.get("language", "Other/Unknown"),
-
         "title": final_pass.get("title", ""),
         "author": final_pass.get("author", ""),
         "publication_place": final_pass.get("publication_place", ""),
@@ -505,9 +504,8 @@ async def extract(req: Request, body: ExtractRequest):
         "illustration_note": final_pass.get("illustration_note", ""),
         "ocr_length": len(ocr_text),
         "extraction_evidence_json": json.dumps(final_pass.get("evidence", {}), ensure_ascii=False),
-
         "debug": {
-            "downloaded_image_bytes": len(image_bytes),
+            "downloaded_image_bytes": downloaded_image_bytes,
             "collection": body.collection,
             "item_id": body.item_id,
             "model": OPENAI_MODEL,
