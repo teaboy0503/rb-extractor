@@ -1,8 +1,8 @@
 import os
 import csv
 import json
-import tempfile
 from datetime import timedelta
+from urllib.parse import quote
 
 import requests
 from google.cloud import storage
@@ -50,8 +50,37 @@ def signed_url_for_gcs_path(gcs_path):
 
 
 def airtable_url():
-    table = AIRTABLE_TABLE_NAME.replace(" ", "%20")
+    table = quote(AIRTABLE_TABLE_NAME)
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}"
+
+
+def get_existing_gcs_paths():
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+    existing = set()
+    offset = None
+
+    while True:
+        url = airtable_url()
+        if offset:
+            url = f"{url}?offset={offset}"
+
+        response = requests.get(url, headers=headers, timeout=60)
+
+        if not response.ok:
+            raise RuntimeError(f"Airtable read error {response.status_code}: {response.text}")
+
+        data = response.json()
+
+        for record in data.get("records", []):
+            path = record.get("fields", {}).get("GCS object path")
+            if path:
+                existing.add(path)
+
+        offset = data.get("offset")
+        if not offset:
+            break
+
+    return existing
 
 
 def create_airtable_record(row):
@@ -64,7 +93,6 @@ def create_airtable_record(row):
                 "filename": row.get("Original filename", "title-page.jpg"),
             }
         ],
-
         "GCS bucket": row.get("GCS bucket", BUCKET_NAME),
         "GCS object path": row.get("GCS object path", ""),
         "Original filename": row.get("Original filename", ""),
@@ -95,7 +123,6 @@ def create_airtable_record(row):
         "Processing status": "Extracted",
     }
 
-    # Remove empty/null fields Airtable may dislike
     fields = {k: v for k, v in fields.items() if v not in [None, ""]}
 
     response = requests.post(
@@ -121,22 +148,38 @@ def main():
         raise RuntimeError("AIRTABLE_BASE_ID missing")
 
     rows = download_results_csv()
-
-    successful_rows = [
-        row for row in rows
-        if row.get("status") == "success"
-    ]
+    successful_rows = [row for row in rows if row.get("status") == "success"]
 
     print(f"Found {len(successful_rows)} successful rows in CSV")
 
-    imported = 0
+    existing_paths = get_existing_gcs_paths()
+    print(f"Found {len(existing_paths)} existing Airtable records with GCS paths")
 
-    for row in successful_rows[:MAX_IMPORT_ROWS]:
+    imported = 0
+    skipped = 0
+
+    for row in successful_rows:
+        if imported >= MAX_IMPORT_ROWS:
+            break
+
+        gcs_path = row.get("GCS object path", "").strip()
+
+        if not gcs_path:
+            print(f"Skipping row with missing GCS object path: {row.get('Original filename')}")
+            skipped += 1
+            continue
+
+        if gcs_path in existing_paths:
+            print(f"Skipping duplicate: {gcs_path}")
+            skipped += 1
+            continue
+
         print(f"Importing: {row.get('Original filename')}")
         create_airtable_record(row)
+        existing_paths.add(gcs_path)
         imported += 1
 
-    print(f"Done. Imported {imported} records.")
+    print(f"Done. Imported {imported} records. Skipped {skipped} records.")
 
 
 if __name__ == "__main__":
