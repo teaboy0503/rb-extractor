@@ -67,6 +67,30 @@ def clean_gcs_object_path(row):
     return f"processed/{filename}"
 
 
+def gcs_path_candidates(gcs_path):
+    gcs_path = (gcs_path or "").strip()
+    candidates = []
+
+    def add(path):
+        if path and path not in candidates:
+            candidates.append(path)
+
+    add(gcs_path)
+
+    if gcs_path.startswith("process/"):
+        add("processed/" + gcs_path.split("/", 1)[1])
+
+    return candidates
+
+
+def resolve_existing_gcs_path(gcs_path):
+    for candidate in gcs_path_candidates(gcs_path):
+        if bucket.blob(candidate).exists():
+            return candidate
+
+    raise RuntimeError(f"GCS object not found: gs://{BUCKET_NAME}/{gcs_path}")
+
+
 def csv_gcs_object_path(row):
     raw = (
         row.get("final_gcs_path")
@@ -92,9 +116,8 @@ def download_results_csv():
 
 
 def signed_url_for_gcs_path(gcs_path):
-    blob = bucket.blob(gcs_path)
-    if not blob.exists():
-        raise RuntimeError(f"GCS object not found: gs://{BUCKET_NAME}/{gcs_path}")
+    clean_path = resolve_existing_gcs_path(gcs_path)
+    blob = bucket.blob(clean_path)
 
     return blob.generate_signed_url(
         version="v4",
@@ -223,7 +246,7 @@ def get_existing_failure_paths():
 
 
 def create_airtable_record(row):
-    clean_path = clean_gcs_object_path(row)
+    clean_path = resolve_existing_gcs_path(clean_gcs_object_path(row))
     image_url = signed_url_for_gcs_path(clean_path)
     batch_record_id = get_or_create_batch_record(row.get("import_batch_id"))
 
@@ -235,7 +258,7 @@ def create_airtable_record(row):
             }
         ],
         "GCS bucket": BUCKET_NAME,
-        "GCS object path raw": clean_path,
+        "GCS object path": clean_path,
         "Original filename": row.get("Original filename", clean_path.split("/")[-1]),
         "Image source": "Google Cloud Storage",
         "Image format": row.get("Image format", "JPG"),
@@ -348,6 +371,13 @@ def main():
 
         if not gcs_path:
             print(f"Skipping row with missing GCS object path: {row.get('Original filename')}")
+            skipped += 1
+            continue
+
+        try:
+            gcs_path = resolve_existing_gcs_path(gcs_path)
+        except RuntimeError as error:
+            print(f"Skipping row with missing GCS object path: {row.get('Original filename')}: {error}")
             skipped += 1
             continue
 
