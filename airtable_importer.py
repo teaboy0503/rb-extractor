@@ -94,7 +94,8 @@ def get_existing_gcs_paths():
         data = response.json()
 
         for record in data.get("records", []):
-            path = record.get("fields", {}).get("GCS object path")
+            fields = record.get("fields", {})
+            path = fields.get("GCS object path raw") or fields.get("GCS object path")
             if path:
                 existing.add(path)
 
@@ -117,7 +118,7 @@ def create_airtable_record(row):
             }
         ],
         "GCS bucket": BUCKET_NAME,
-        "GCS object path": clean_path,
+        "GCS object path raw": clean_path,
         "Original filename": row.get("Original filename", clean_path.split("/")[-1]),
         "Image source": "Google Cloud Storage",
         "Image format": row.get("Image format", "JPG"),
@@ -141,6 +142,7 @@ def create_airtable_record(row):
 
         "Extraction JSON": row.get("extraction_json", ""),
         "Extraction evidence JSON": row.get("extraction_evidence_json", ""),
+        "Quality flags JSON": row.get("quality_flags_json", ""),
 
         "Extraction status": "Done",
         "Processing status": "Extracted",
