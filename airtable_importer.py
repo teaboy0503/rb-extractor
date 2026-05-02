@@ -31,6 +31,28 @@ storage_client = get_storage_client()
 bucket = storage_client.bucket(BUCKET_NAME)
 
 
+def clean_gcs_object_path(row):
+    raw = (
+        row.get("final_gcs_path")
+        or row.get("GCS object path")
+        or row.get("image_ref")
+        or row.get("Original filename")
+        or ""
+    ).strip()
+
+    raw = raw.replace(f"gs://{BUCKET_NAME}/", "")
+    raw = raw.replace(f"{BUCKET_NAME}/", "")
+
+    filename = raw.split("/")[-1]
+
+    if ".jpg-" in filename:
+        filename = filename.split(".jpg-")[0] + ".jpg"
+    if ".jpeg-" in filename:
+        filename = filename.split(".jpeg-")[0] + ".jpeg"
+
+    return f"processed/{filename}"
+
+
 def download_results_csv():
     blob = bucket.blob(RESULTS_PATH)
     if not blob.exists():
@@ -84,18 +106,19 @@ def get_existing_gcs_paths():
 
 
 def create_airtable_record(row):
-    image_url = signed_url_for_gcs_path(row["GCS object path"])
+    clean_path = clean_gcs_object_path(row)
+    image_url = signed_url_for_gcs_path(clean_path)
 
     fields = {
         "Title page image": [
             {
                 "url": image_url,
-                "filename": row.get("Original filename", "title-page.jpg"),
+                "filename": clean_path.split("/")[-1],
             }
         ],
-        "GCS bucket": row.get("GCS bucket", BUCKET_NAME),
-        "GCS object path": row.get("GCS object path", ""),
-        "Original filename": row.get("Original filename", ""),
+        "GCS bucket": BUCKET_NAME,
+        "GCS object path": clean_path,
+        "Original filename": row.get("Original filename", clean_path.split("/")[-1]),
         "Image source": "Google Cloud Storage",
         "Image format": row.get("Image format", "JPG"),
 
@@ -162,7 +185,7 @@ def main():
         if imported >= MAX_IMPORT_ROWS:
             break
 
-        gcs_path = row.get("GCS object path", "").strip()
+        gcs_path = clean_gcs_object_path(row)
 
         if not gcs_path:
             print(f"Skipping row with missing GCS object path: {row.get('Original filename')}")
@@ -174,7 +197,7 @@ def main():
             skipped += 1
             continue
 
-        print(f"Importing: {row.get('Original filename')}")
+        print(f"Importing: {row.get('Original filename')} -> {gcs_path}")
         create_airtable_record(row)
         existing_paths.add(gcs_path)
         imported += 1
