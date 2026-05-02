@@ -76,7 +76,7 @@ def create_airtable_record(row):
         "OCR length": int(float(row["ocr_length"])) if row.get("ocr_length") else None,
 
         "LLM confidence": float(row["llm_confidence"]) if row.get("llm_confidence") else None,
-        "Language detected": {"name": row.get("language", "Other/Unknown") or "Other/Unknown"},
+        "Language detected": row.get("language", "Other/Unknown") or "Other/Unknown",
 
         "Title (extracted)": row.get("title", ""),
         "Author (extracted)": row.get("author", ""),
