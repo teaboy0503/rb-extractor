@@ -192,6 +192,25 @@ def json_string_or_blank(value):
     return json.dumps(value, ensure_ascii=False)
 
 
+def build_extraction_messages(ocr_text):
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Extract rare-book title page metadata from OCR text. "
+                "Return only a JSON object with keys: llm_confidence, language, "
+                "title, author, publication_place, publisher, publication_year, "
+                "edition_statement, publication_statement_verbatim, translator, "
+                "illustration_note, extraction_evidence_json."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"OCR text:\n{ocr_text[:MAX_OCR_CHARS_FOR_LLM]}",
+        },
+    ]
+
+
 @app.get("/")
 def health():
     return {"status": "ok", "version": "1.6.3-quality-flags"}
@@ -221,9 +240,7 @@ async def extract(req: Request, body: ExtractRequest):
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[
-            {"role": "user", "content": ocr_text},
-        ],
+        messages=build_extraction_messages(ocr_text),
         response_format={"type": "json_object"},
     )
 
