@@ -91,6 +91,14 @@ def resolve_existing_gcs_path(gcs_path):
     raise RuntimeError(f"GCS object not found: gs://{BUCKET_NAME}/{gcs_path}")
 
 
+def existing_path_for_gcs_path(gcs_path, existing_paths):
+    for candidate in gcs_path_candidates(gcs_path):
+        if candidate in existing_paths:
+            return candidate
+
+    return None
+
+
 def csv_gcs_object_path(row):
     raw = (
         row.get("final_gcs_path")
@@ -360,8 +368,12 @@ def main():
 
     imported = 0
     skipped = 0
+    duplicate_skipped = 0
+    duplicate_examples = []
     failure_imported = 0
     failure_skipped = 0
+    failure_duplicate_skipped = 0
+    failure_duplicate_examples = []
 
     for row in successful_rows:
         if imported >= MAX_IMPORT_ROWS:
@@ -374,6 +386,14 @@ def main():
             skipped += 1
             continue
 
+        existing_gcs_path = existing_path_for_gcs_path(gcs_path, existing_paths)
+        if existing_gcs_path:
+            duplicate_skipped += 1
+            skipped += 1
+            if len(duplicate_examples) < 5:
+                duplicate_examples.append(existing_gcs_path)
+            continue
+
         try:
             gcs_path = resolve_existing_gcs_path(gcs_path)
         except RuntimeError as error:
@@ -381,9 +401,12 @@ def main():
             skipped += 1
             continue
 
-        if gcs_path in existing_paths:
-            print(f"Skipping duplicate: {gcs_path}")
+        existing_gcs_path = existing_path_for_gcs_path(gcs_path, existing_paths)
+        if existing_gcs_path:
+            duplicate_skipped += 1
             skipped += 1
+            if len(duplicate_examples) < 5:
+                duplicate_examples.append(existing_gcs_path)
             continue
 
         print(f"Importing: {row.get('Original filename')} -> {gcs_path}")
@@ -403,9 +426,12 @@ def main():
                 failure_skipped += 1
                 continue
 
-            if gcs_path in existing_failure_paths:
-                print(f"Skipping duplicate failure: {gcs_path}")
+            existing_failure_path = existing_path_for_gcs_path(gcs_path, existing_failure_paths)
+            if existing_failure_path:
+                failure_duplicate_skipped += 1
                 failure_skipped += 1
+                if len(failure_duplicate_examples) < 5:
+                    failure_duplicate_examples.append(existing_failure_path)
                 continue
 
             print(f"Recording failure: {row.get('Original filename')} -> {gcs_path}")
@@ -414,8 +440,15 @@ def main():
             failure_imported += 1
 
     print(f"Done. Imported {imported} records. Skipped {skipped} records.")
+    if duplicate_skipped:
+        print(f"Skipped {duplicate_skipped} duplicate successful rows. Examples: {', '.join(duplicate_examples)}")
     if AIRTABLE_FAILURE_TABLE_NAME:
         print(f"Failures recorded {failure_imported}. Failure rows skipped {failure_skipped}.")
+        if failure_duplicate_skipped:
+            print(
+                f"Skipped {failure_duplicate_skipped} duplicate failure rows. "
+                f"Examples: {', '.join(failure_duplicate_examples)}"
+            )
 
 
 if __name__ == "__main__":
