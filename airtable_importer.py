@@ -91,8 +91,8 @@ def create_airtable_record(row):
         "Extraction JSON": row.get("extraction_json", ""),
         "Extraction evidence JSON": row.get("extraction_evidence_json", ""),
 
-        "Extraction status": {"name": "Done"},
-        "Processing status": {"name": "Extracted"},
+        "Extraction status": "Done",
+        "Processing status": "Extracted",
     }
 
     # Remove empty/null fields Airtable may dislike
