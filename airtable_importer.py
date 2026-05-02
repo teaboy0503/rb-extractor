@@ -68,8 +68,8 @@ def create_airtable_record(row):
         "GCS bucket": row.get("GCS bucket", BUCKET_NAME),
         "GCS object path": row.get("GCS object path", ""),
         "Original filename": row.get("Original filename", ""),
-        "Image source": {"name": "Google Cloud Storage"},
-        "Image format": {"name": row.get("Image format", "JPG")},
+        "Image source": "Google Cloud Storage",
+        "Image format": row.get("Image format", "JPG"),
 
         "OCR raw text": row.get("ocr_text", ""),
         "OCR confidence": float(row["ocr_confidence"]) if row.get("ocr_confidence") else None,
