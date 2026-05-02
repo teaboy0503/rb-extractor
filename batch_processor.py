@@ -17,12 +17,21 @@ INPUT_PREFIX = os.getenv("BATCH_INPUT_PREFIX", "to_process/")
 PROCESSED_PREFIX = os.getenv("BATCH_PROCESSED_PREFIX", "processed/")
 FAILED_PREFIX = os.getenv("BATCH_FAILED_PREFIX", "failed/")
 RESULTS_PATH = os.getenv("BATCH_RESULTS_PATH", "results/batch_results.csv")
+IMPORT_BATCH_ID = os.getenv("IMPORT_BATCH_ID") or datetime.now(UTC).strftime("batch-%Y%m%dT%H%M%SZ")
 
 EXTRACTOR_URL = os.getenv("EXTRACTOR_URL", "https://rb-extractor.onrender.com/extract")
 EXTRACTOR_API_KEY = os.getenv("API_KEY", "")
 
 MAX_FILES = int(os.getenv("MAX_FILES", "3"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1.5"))
+MAX_EXTRACTOR_ATTEMPTS = max(1, int(os.getenv("MAX_EXTRACTOR_ATTEMPTS", "3")))
+RETRY_SLEEP_SECONDS = float(os.getenv("RETRY_SLEEP_SECONDS", "5"))
+
+
+class ExtractorError(RuntimeError):
+    def __init__(self, status_code, response_text):
+        self.status_code = status_code
+        super().__init__(f"Extractor error {status_code}: {response_text}")
 
 
 def get_storage_client():
@@ -63,9 +72,33 @@ def call_extractor(blob_name):
     )
 
     if not response.ok:
-        raise RuntimeError(f"Extractor error {response.status_code}: {response.text}")
+        raise ExtractorError(response.status_code, response.text)
 
     return response.json()
+
+
+def should_retry_extractor_error(error):
+    if isinstance(error, ExtractorError):
+        return error.status_code == 429 or error.status_code >= 500
+    return True
+
+
+def call_extractor_with_retries(blob_name):
+    last_error = None
+
+    for attempt in range(1, MAX_EXTRACTOR_ATTEMPTS + 1):
+        try:
+            return call_extractor(blob_name), attempt
+        except Exception as error:
+            last_error = error
+            setattr(last_error, "attempts", attempt)
+            if attempt >= MAX_EXTRACTOR_ATTEMPTS or not should_retry_extractor_error(error):
+                break
+
+            print(f"Extractor attempt {attempt} failed for {blob_name}: {error}")
+            time.sleep(RETRY_SLEEP_SECONDS * attempt)
+
+    raise last_error
 
 
 def move_blob(blob, destination_prefix):
@@ -97,6 +130,7 @@ def upload_results(rows):
         "extraction_json",
         "GCS bucket", "GCS object path", "Original filename", "Image source",
         "Image format", "Extraction status",
+        "import_batch_id", "extraction_attempts",
     ]
 
     with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", delete=False) as tmp:
@@ -111,7 +145,7 @@ def upload_results(rows):
     bucket.blob(RESULTS_PATH).upload_from_filename(temp_path, content_type="text/csv")
 
 
-def result_row_success(source_path, final_path, data):
+def result_row_success(source_path, final_path, data, attempts):
     filename = source_path.split("/")[-1]
 
     return {
@@ -146,10 +180,12 @@ def result_row_success(source_path, final_path, data):
         "Image source": "Google Cloud Storage",
         "Image format": "JPG",
         "Extraction status": "Done",
+        "import_batch_id": IMPORT_BATCH_ID,
+        "extraction_attempts": attempts,
     }
 
 
-def result_row_failed(source_path, final_path, error):
+def result_row_failed(source_path, final_path, error, attempts):
     filename = source_path.split("/")[-1]
 
     return {
@@ -164,14 +200,18 @@ def result_row_failed(source_path, final_path, error):
         "Image source": "Google Cloud Storage",
         "Image format": "JPG",
         "Extraction status": "Error",
+        "import_batch_id": IMPORT_BATCH_ID,
+        "extraction_attempts": attempts,
     }
 
 
 def main():
     print(f"Bucket: {BUCKET_NAME}")
     print(f"Input prefix: {INPUT_PREFIX}")
+    print(f"Import batch ID: {IMPORT_BATCH_ID}")
     print(f"Max files: {MAX_FILES}")
     print(f"Sleep seconds: {SLEEP_SECONDS}")
+    print(f"Max extractor attempts: {MAX_EXTRACTOR_ATTEMPTS}")
 
     blobs = list_input_blobs()
     print(f"Found {len(blobs)} file(s) to process")
@@ -197,18 +237,20 @@ def main():
             continue
 
         print(f"Processing: {source_path}")
+        attempts = 0
 
         try:
-            data = call_extractor(source_path)
+            data, attempts = call_extractor_with_retries(source_path)
             final_path = move_blob(blob, PROCESSED_PREFIX)
 
-            rows.append(result_row_success(source_path, final_path, data))
+            rows.append(result_row_success(source_path, final_path, data, attempts))
             already_successful.add(source_path)
             upload_results(rows)
 
             print(f"Success: {source_path} -> {final_path}")
 
         except Exception as error:
+            attempts = getattr(error, "attempts", attempts)
             print(f"Failed: {source_path}: {error}")
 
             try:
@@ -216,7 +258,7 @@ def main():
             except Exception:
                 final_path = source_path
 
-            rows.append(result_row_failed(source_path, final_path, error))
+            rows.append(result_row_failed(source_path, final_path, error, attempts))
             upload_results(rows)
 
         time.sleep(SLEEP_SECONDS)

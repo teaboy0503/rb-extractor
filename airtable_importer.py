@@ -17,8 +17,16 @@ RESULTS_PATH = os.getenv("BATCH_RESULTS_PATH", "results/batch_results.csv")
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Items")
+AIRTABLE_BATCH_TABLE_NAME = os.getenv("AIRTABLE_BATCH_TABLE_NAME", "Batches")
+AIRTABLE_BATCH_NAME_FIELD = os.getenv("AIRTABLE_BATCH_NAME_FIELD", "Batch name")
+AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Related Batch")
+AIRTABLE_FAILURE_TABLE_NAME = os.getenv("AIRTABLE_FAILURE_TABLE_NAME", "")
+AIRTABLE_FAILURE_BATCH_LINK_FIELD = os.getenv("AIRTABLE_FAILURE_BATCH_LINK_FIELD", "")
 
 MAX_IMPORT_ROWS = int(os.getenv("MAX_IMPORT_ROWS", "25"))
+MAX_FAILURE_IMPORT_ROWS = int(os.getenv("MAX_FAILURE_IMPORT_ROWS", str(MAX_IMPORT_ROWS)))
+
+batch_record_cache = {}
 
 
 def get_storage_client():
@@ -32,13 +40,19 @@ bucket = storage_client.bucket(BUCKET_NAME)
 
 
 def clean_gcs_object_path(row):
+    final_path = (row.get("final_gcs_path") or "").strip()
+    if final_path:
+        return final_path
+
     raw = (
-        row.get("final_gcs_path")
-        or row.get("GCS object path")
+        row.get("GCS object path")
         or row.get("image_ref")
         or row.get("Original filename")
         or ""
     ).strip()
+
+    if not raw:
+        return ""
 
     raw = raw.replace(f"gs://{BUCKET_NAME}/", "")
     raw = raw.replace(f"{BUCKET_NAME}/", "")
@@ -53,6 +67,21 @@ def clean_gcs_object_path(row):
     return f"processed/{filename}"
 
 
+def csv_gcs_object_path(row):
+    raw = (
+        row.get("final_gcs_path")
+        or row.get("GCS object path")
+        or row.get("image_ref")
+        or row.get("source_gcs_path")
+        or row.get("Original filename")
+        or ""
+    ).strip()
+
+    raw = raw.replace(f"gs://{BUCKET_NAME}/", "")
+    raw = raw.replace(f"{BUCKET_NAME}/", "")
+    return raw
+
+
 def download_results_csv():
     blob = bucket.blob(RESULTS_PATH)
     if not blob.exists():
@@ -64,6 +93,9 @@ def download_results_csv():
 
 def signed_url_for_gcs_path(gcs_path):
     blob = bucket.blob(gcs_path)
+    if not blob.exists():
+        raise RuntimeError(f"GCS object not found: gs://{BUCKET_NAME}/{gcs_path}")
+
     return blob.generate_signed_url(
         version="v4",
         expiration=timedelta(hours=2),
@@ -71,9 +103,62 @@ def signed_url_for_gcs_path(gcs_path):
     )
 
 
-def airtable_url():
-    table = quote(AIRTABLE_TABLE_NAME)
+def airtable_url(table_name=None):
+    table = quote(table_name or AIRTABLE_TABLE_NAME)
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}"
+
+
+def airtable_headers():
+    return {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def airtable_formula_string(value):
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def get_or_create_batch_record(batch_name):
+    batch_name = (batch_name or "").strip()
+    if not batch_name:
+        return None
+
+    if batch_name in batch_record_cache:
+        return batch_record_cache[batch_name]
+
+    response = requests.get(
+        airtable_url(AIRTABLE_BATCH_TABLE_NAME),
+        headers=airtable_headers(),
+        params={
+            "filterByFormula": f"{{{AIRTABLE_BATCH_NAME_FIELD}}} = {airtable_formula_string(batch_name)}",
+            "maxRecords": 1,
+        },
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Airtable batch lookup error {response.status_code}: {response.text}")
+
+    records = response.json().get("records", [])
+    if records:
+        batch_record_id = records[0]["id"]
+        batch_record_cache[batch_name] = batch_record_id
+        return batch_record_id
+
+    response = requests.post(
+        airtable_url(AIRTABLE_BATCH_TABLE_NAME),
+        headers=airtable_headers(),
+        json={"fields": {AIRTABLE_BATCH_NAME_FIELD: batch_name}},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Airtable batch create error {response.status_code}: {response.text}")
+
+    batch_record_id = response.json()["id"]
+    batch_record_cache[batch_name] = batch_record_id
+    return batch_record_id
 
 
 def get_existing_gcs_paths():
@@ -106,9 +191,41 @@ def get_existing_gcs_paths():
     return existing
 
 
+def get_existing_failure_paths():
+    if not AIRTABLE_FAILURE_TABLE_NAME:
+        return set()
+
+    existing = set()
+    offset = None
+
+    while True:
+        url = airtable_url(AIRTABLE_FAILURE_TABLE_NAME)
+        if offset:
+            url = f"{url}?offset={offset}"
+
+        response = requests.get(url, headers=airtable_headers(), timeout=60)
+
+        if not response.ok:
+            raise RuntimeError(f"Airtable failure read error {response.status_code}: {response.text}")
+
+        data = response.json()
+
+        for record in data.get("records", []):
+            path = record.get("fields", {}).get("GCS object path")
+            if path:
+                existing.add(path)
+
+        offset = data.get("offset")
+        if not offset:
+            break
+
+    return existing
+
+
 def create_airtable_record(row):
     clean_path = clean_gcs_object_path(row)
     image_url = signed_url_for_gcs_path(clean_path)
+    batch_record_id = get_or_create_batch_record(row.get("import_batch_id"))
 
     fields = {
         "Title page image": [
@@ -128,6 +245,7 @@ def create_airtable_record(row):
         "OCR length": int(float(row["ocr_length"])) if row.get("ocr_length") else None,
 
         "LLM confidence": float(row["llm_confidence"]) if row.get("llm_confidence") else None,
+        "Extraction attempts": int(float(row["extraction_attempts"])) if row.get("extraction_attempts") else None,
         "Language detected": row.get("language", "Other/Unknown") or "Other/Unknown",
 
         "Title (extracted)": row.get("title", ""),
@@ -148,20 +266,52 @@ def create_airtable_record(row):
         "Processing status": "Extracted",
     }
 
+    if batch_record_id:
+        fields[AIRTABLE_ITEM_BATCH_LINK_FIELD] = [batch_record_id]
+
     fields = {k: v for k, v in fields.items() if v not in [None, ""]}
 
     response = requests.post(
         airtable_url(),
-        headers={
-            "Authorization": f"Bearer {AIRTABLE_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        headers=airtable_headers(),
         json={"fields": fields},
         timeout=60,
     )
 
     if not response.ok:
         raise RuntimeError(f"Airtable error {response.status_code}: {response.text}")
+
+    return response.json()
+
+
+def create_failure_record(row):
+    gcs_path = csv_gcs_object_path(row)
+    batch_record_id = get_or_create_batch_record(row.get("import_batch_id"))
+
+    fields = {
+        "GCS bucket": BUCKET_NAME,
+        "GCS object path": gcs_path,
+        "Original filename": row.get("Original filename", gcs_path.split("/")[-1]),
+        "Failure stage": "Extraction",
+        "Error message": row.get("error", ""),
+        "Retry count": int(float(row["extraction_attempts"])) if row.get("extraction_attempts") else None,
+        "Resolved?": False,
+    }
+
+    if batch_record_id and AIRTABLE_FAILURE_BATCH_LINK_FIELD:
+        fields[AIRTABLE_FAILURE_BATCH_LINK_FIELD] = [batch_record_id]
+
+    fields = {k: v for k, v in fields.items() if v not in [None, ""]}
+
+    response = requests.post(
+        airtable_url(AIRTABLE_FAILURE_TABLE_NAME),
+        headers=airtable_headers(),
+        json={"fields": fields},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Airtable failure create error {response.status_code}: {response.text}")
 
     return response.json()
 
@@ -174,14 +324,21 @@ def main():
 
     rows = download_results_csv()
     successful_rows = [row for row in rows if row.get("status") == "success"]
+    failed_rows = [row for row in rows if row.get("status") == "failed"]
 
     print(f"Found {len(successful_rows)} successful rows in CSV")
+    print(f"Found {len(failed_rows)} failed rows in CSV")
 
     existing_paths = get_existing_gcs_paths()
     print(f"Found {len(existing_paths)} existing Airtable records with GCS paths")
+    existing_failure_paths = get_existing_failure_paths()
+    if AIRTABLE_FAILURE_TABLE_NAME:
+        print(f"Found {len(existing_failure_paths)} existing Airtable failure records with GCS paths")
 
     imported = 0
     skipped = 0
+    failure_imported = 0
+    failure_skipped = 0
 
     for row in successful_rows:
         if imported >= MAX_IMPORT_ROWS:
@@ -204,7 +361,31 @@ def main():
         existing_paths.add(gcs_path)
         imported += 1
 
+    if AIRTABLE_FAILURE_TABLE_NAME:
+        for row in failed_rows:
+            if failure_imported >= MAX_FAILURE_IMPORT_ROWS:
+                break
+
+            gcs_path = csv_gcs_object_path(row)
+
+            if not gcs_path:
+                print(f"Skipping failed row with missing GCS object path: {row.get('Original filename')}")
+                failure_skipped += 1
+                continue
+
+            if gcs_path in existing_failure_paths:
+                print(f"Skipping duplicate failure: {gcs_path}")
+                failure_skipped += 1
+                continue
+
+            print(f"Recording failure: {row.get('Original filename')} -> {gcs_path}")
+            create_failure_record(row)
+            existing_failure_paths.add(gcs_path)
+            failure_imported += 1
+
     print(f"Done. Imported {imported} records. Skipped {skipped} records.")
+    if AIRTABLE_FAILURE_TABLE_NAME:
+        print(f"Failures recorded {failure_imported}. Failure rows skipped {failure_skipped}.")
 
 
 if __name__ == "__main__":

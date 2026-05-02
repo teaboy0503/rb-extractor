@@ -184,6 +184,14 @@ def build_quality_flags(ocr_text, ocr_conf, parsed):
     }
 
 
+def json_string_or_blank(value):
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
 @app.get("/")
 def health():
     return {"status": "ok", "version": "1.6.3-quality-flags"}
@@ -222,15 +230,29 @@ async def extract(req: Request, body: ExtractRequest):
     parsed = normalize_parsed_output(json.loads(resp.choices[0].message.content))
 
     quality_flags = build_quality_flags(ocr_text, ocr_conf, parsed)
+    extraction_evidence_json = json_string_or_blank(
+        parsed.get("extraction_evidence_json") or parsed.get("extraction_evidence")
+    )
 
     return {
         "app_version": "1.6.3-quality-flags",
+        "image_source": "Google Cloud Storage" if body.gcs_bucket else "URL",
+        "image_ref": (body.gcs_object_path or "") if body.gcs_bucket else (image_url or ""),
         "ocr_text": ocr_text,
         "ocr_confidence": ocr_conf,
-        "llm_confidence": parsed.get("llm_confidence"),
-        "title": parsed.get("title"),
-        "author": parsed.get("author"),
+        "ocr_length": len(ocr_text),
+        "llm_confidence": parsed.get("llm_confidence", 0.0),
+        "language": parsed.get("language", "") or "",
+        "title": parsed.get("title", "") or "",
+        "author": parsed.get("author", "") or "",
+        "publication_place": parsed.get("publication_place", "") or "",
+        "publisher": parsed.get("publisher", "") or "",
         "publication_year": parsed.get("publication_year"),
+        "edition_statement": parsed.get("edition_statement", "") or "",
+        "publication_statement_verbatim": parsed.get("publication_statement_verbatim", "") or "",
+        "translator": parsed.get("translator", "") or "",
+        "illustration_note": parsed.get("illustration_note", "") or "",
+        "extraction_evidence_json": extraction_evidence_json,
         "quality_flags_json": json.dumps(quality_flags),
         "debug": {
             "downloaded_image_bytes": downloaded_image_bytes,
