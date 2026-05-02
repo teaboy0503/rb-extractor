@@ -93,7 +93,8 @@ def upload_results(rows):
         "ocr_text", "ocr_confidence", "ocr_length", "llm_confidence", "language",
         "title", "author", "publication_place", "publisher", "publication_year",
         "edition_statement", "publication_statement_verbatim", "translator",
-        "illustration_note", "extraction_evidence_json", "extraction_json",
+        "illustration_note", "extraction_evidence_json", "quality_flags_json",
+        "extraction_json",
         "GCS bucket", "GCS object path", "Original filename", "Image source",
         "Image format", "Extraction status",
     ]
@@ -137,6 +138,7 @@ def result_row_success(source_path, final_path, data):
         "translator": data.get("translator", ""),
         "illustration_note": data.get("illustration_note", ""),
         "extraction_evidence_json": data.get("extraction_evidence_json", ""),
+        "quality_flags_json": data.get("quality_flags_json", ""),
         "extraction_json": json.dumps(data, ensure_ascii=False),
         "GCS bucket": BUCKET_NAME,
         "GCS object path": final_path,
