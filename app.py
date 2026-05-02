@@ -163,10 +163,25 @@ def clamp01(x):
         return 0.0
 
 
+def parse_publication_year(value):
+    if value in [None, ""]:
+        return None
+
+    try:
+        return int(float(value))
+    except:
+        match = re.search(r"\b(1[4-9]\d{2}|20[0-2]\d)\b", str(value))
+        if match:
+            return int(match.group(1))
+
+    return None
+
+
 def normalize_parsed_output(parsed):
     parsed["llm_confidence"] = clamp01(parsed.get("llm_confidence"))
     if parsed["llm_confidence"] >= 1:
         parsed["llm_confidence"] = 0.95
+    parsed["publication_year"] = parse_publication_year(parsed.get("publication_year"))
     return parsed
 
 
