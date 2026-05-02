@@ -22,6 +22,7 @@ AIRTABLE_BATCH_NAME_FIELD = os.getenv("AIRTABLE_BATCH_NAME_FIELD", "Batch name")
 AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Related Batch")
 AIRTABLE_FAILURE_TABLE_NAME = os.getenv("AIRTABLE_FAILURE_TABLE_NAME", "")
 AIRTABLE_FAILURE_BATCH_LINK_FIELD = os.getenv("AIRTABLE_FAILURE_BATCH_LINK_FIELD", "")
+AIRTABLE_QUALITY_FLAGS_FIELD = os.getenv("AIRTABLE_QUALITY_FLAGS_FIELD", "")
 
 MAX_IMPORT_ROWS = int(os.getenv("MAX_IMPORT_ROWS", "25"))
 MAX_FAILURE_IMPORT_ROWS = int(os.getenv("MAX_FAILURE_IMPORT_ROWS", str(MAX_IMPORT_ROWS)))
@@ -291,11 +292,13 @@ def create_airtable_record(row):
 
         "Extraction JSON": row.get("extraction_json", ""),
         "Extraction evidence JSON": row.get("extraction_evidence_json", ""),
-        "Quality flags JSON": row.get("quality_flags_json", ""),
 
         "Extraction status": "Done",
         "Processing status": "Extracted",
     }
+
+    if AIRTABLE_QUALITY_FLAGS_FIELD and row.get("quality_flags_json"):
+        fields[AIRTABLE_QUALITY_FLAGS_FIELD] = row.get("quality_flags_json")
 
     if batch_record_id:
         fields[AIRTABLE_ITEM_BATCH_LINK_FIELD] = [batch_record_id]
