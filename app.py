@@ -25,7 +25,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "90"))
 MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 
-app = FastAPI(title="RB Extractor", version="1.6.1-gcs")
+app = FastAPI(title="RB Extractor", version="1.6.2-confidence")
 
 
 class ExtractRequest(BaseModel):
@@ -169,7 +169,15 @@ def run_ocr_document_text(image_bytes: bytes) -> Tuple[str, float]:
     except Exception:
         confidences = []
 
-    avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+    if not full_text:
+        avg_conf = 0.0
+    elif not confidences:
+        avg_conf = min(0.75, len(full_text) / 1000)
+    else:
+        base_conf = sum(confidences) / len(confidences)
+        length_factor = min(1.0, len(full_text) / 500)
+        avg_conf = min(0.99, base_conf * (0.5 + 0.5 * length_factor))
+
     return full_text, float(avg_conf)
 
 
@@ -256,7 +264,6 @@ def clamp01(x: Any) -> float:
 
 def normalize_parsed_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
     parsed["language"] = normalize_language(parsed.get("language"))
-    parsed["llm_confidence"] = clamp01(parsed.get("llm_confidence"))
     parsed["publication_year"] = coerce_year(parsed.get("publication_year"))
 
     text_fields = [
@@ -273,6 +280,18 @@ def normalize_parsed_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
     for k in text_fields:
         parsed[k] = "" if parsed.get(k) is None else str(parsed.get(k, "")).strip()
 
+    llm_conf = clamp01(parsed.get("llm_confidence"))
+
+    if llm_conf >= 1.0:
+        llm_conf = 0.95
+
+    missing_penalty = 0.0
+    for field in ["title", "author", "publication_year"]:
+        if not parsed.get(field):
+            missing_penalty += 0.10
+
+    parsed["llm_confidence"] = max(0.0, round(llm_conf - missing_penalty, 3))
+
     if "evidence" not in parsed or parsed["evidence"] is None or not isinstance(parsed["evidence"], dict):
         parsed["evidence"] = {}
 
@@ -280,6 +299,14 @@ def normalize_parsed_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
         parsed["evidence"][k] = "" if parsed["evidence"].get(k) is None else str(parsed["evidence"].get(k, "")).strip()
 
     return parsed
+
+
+CONFIDENCE_RULE = (
+    "Set llm_confidence carefully: 1.0 only if all key fields are completely certain and clearly visible; "
+    "0.8-0.95 for strong extraction with minor uncertainty; "
+    "0.5-0.8 for moderate uncertainty; below 0.5 for weak extraction. "
+    "Do not default to 1.0."
+)
 
 
 def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
@@ -315,6 +342,7 @@ def llm_parse_title_page(ocr_text: str, image_url: str) -> Dict[str, Any]:
             "Translator only if explicitly stated.",
             "Illustration note should capture references to plates, engravings, profiles, figures, Kupfern, etc.",
             "Language must be one of: English, French, German, Latin, Other/Unknown.",
+            CONFIDENCE_RULE,
         ],
         "required_json_schema": {
             "language": "English|French|German|Latin|Other/Unknown",
@@ -388,6 +416,7 @@ def verify_title_page_extraction(ocr_text: str, image_url: str, draft: Dict[str,
             "If publication_place or publisher is uncertain, return empty string.",
             "Preserve publication_statement_verbatim close to printed imprint.",
             "Adjust llm_confidence downward if key fields are uncertain.",
+            CONFIDENCE_RULE,
         ],
         "required_json_schema": {
             "language": "English|French|German|Latin|Other/Unknown",
@@ -437,7 +466,7 @@ def verify_title_page_extraction(ocr_text: str, image_url: str, draft: Dict[str,
 
 @app.get("/")
 def health():
-    return {"status": "ok", "version": "1.6.1-gcs"}
+    return {"status": "ok", "version": "1.6.2-confidence"}
 
 
 @app.post("/extract")
@@ -468,7 +497,6 @@ async def extract(req: Request, body: ExtractRequest):
         raise HTTPException(status_code=400, detail="Provide either image_url or both gcs_bucket and gcs_object_path")
 
     image_bytes, orientation_action = fix_image_orientation(image_bytes)
-
     downloaded_image_bytes = len(image_bytes)
 
     ocr_text, ocr_conf = run_ocr_document_text(image_bytes)
@@ -487,7 +515,7 @@ async def extract(req: Request, body: ExtractRequest):
 
     return {
         "record_id": body.record_id,
-        "app_version": "1.6.1-gcs",
+        "app_version": "1.6.2-confidence",
         "image_source": image_source,
         "image_ref": image_ref,
         "ocr_text": ocr_text,
