@@ -1,7 +1,7 @@
 import os
 import csv
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
 import requests
@@ -13,12 +13,15 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 BUCKET_NAME = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 RESULTS_PATH = os.getenv("BATCH_RESULTS_PATH", "results/batch_results.csv")
+IMPORT_BATCH_ID = os.getenv("IMPORT_BATCH_ID", "").strip()
 
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Items")
 AIRTABLE_BATCH_TABLE_NAME = os.getenv("AIRTABLE_BATCH_TABLE_NAME", "Batches")
 AIRTABLE_BATCH_NAME_FIELD = os.getenv("AIRTABLE_BATCH_NAME_FIELD", "Batch name")
+AIRTABLE_BATCH_DATE_IMPORTED_FIELD = os.getenv("AIRTABLE_BATCH_DATE_IMPORTED_FIELD", "Date imported")
+AIRTABLE_BATCH_NOTES_FIELD = os.getenv("AIRTABLE_BATCH_NOTES_FIELD", "Batch Notes")
 AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Related Batch")
 AIRTABLE_FAILURE_TABLE_NAME = os.getenv("AIRTABLE_FAILURE_TABLE_NAME", "")
 AIRTABLE_FAILURE_BATCH_LINK_FIELD = os.getenv("AIRTABLE_FAILURE_BATCH_LINK_FIELD", "")
@@ -140,6 +143,10 @@ def airtable_url(table_name=None):
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}"
 
 
+def airtable_record_url(table_name, record_id):
+    return f"{airtable_url(table_name)}/{record_id}"
+
+
 def airtable_headers():
     return {
         "Authorization": f"Bearer {AIRTABLE_API_KEY}",
@@ -202,6 +209,106 @@ def get_or_create_batch_record(batch_name):
     batch_record_id = response.json()["id"]
     batch_record_cache[batch_name] = batch_record_id
     return batch_record_id
+
+
+def get_airtable_record(table_name, record_id):
+    response = requests.get(
+        airtable_record_url(table_name, record_id),
+        headers=airtable_headers(),
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Airtable record read error {response.status_code}: {response.text}")
+
+    return response.json()
+
+
+def update_airtable_record(table_name, record_id, fields):
+    response = requests.patch(
+        airtable_record_url(table_name, record_id),
+        headers=airtable_headers(),
+        json={"fields": fields},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Airtable record update error {response.status_code}: {response.text}")
+
+    return response.json()
+
+
+def rows_for_import_batch(rows):
+    if not IMPORT_BATCH_ID:
+        return rows
+
+    return [
+        row for row in rows
+        if (row.get("import_batch_id") or "").strip() == IMPORT_BATCH_ID
+    ]
+
+
+def batch_name_for_summary(rows):
+    if IMPORT_BATCH_ID:
+        return IMPORT_BATCH_ID
+
+    batch_names = {
+        (row.get("import_batch_id") or "").strip()
+        for row in rows
+        if (row.get("import_batch_id") or "").strip()
+    }
+
+    if len(batch_names) == 1:
+        return next(iter(batch_names))
+
+    return None
+
+
+def append_batch_summary(existing_notes, summary):
+    existing_notes = (existing_notes or "").rstrip()
+    if summary in existing_notes:
+        return existing_notes
+    if not existing_notes:
+        return summary
+    return f"{existing_notes}\n\n{summary}"
+
+
+def build_batch_summary(summary):
+    timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+    return "\n".join([
+        f"Import run: {timestamp}",
+        f"Results CSV: gs://{BUCKET_NAME}/{RESULTS_PATH}",
+        f"Successful rows in CSV: {summary['successful_rows']}",
+        f"Failed rows in CSV: {summary['failed_rows']}",
+        f"Items imported this run: {summary['imported']}",
+        f"Item rows skipped this run: {summary['skipped']}",
+        f"Duplicate item rows skipped: {summary['duplicate_skipped']}",
+        f"Failures recorded this run: {summary['failure_imported']}",
+        f"Failure rows skipped this run: {summary['failure_skipped']}",
+        f"Duplicate failure rows skipped: {summary['failure_duplicate_skipped']}",
+    ])
+
+
+def update_batch_summary(rows, summary):
+    batch_name = batch_name_for_summary(rows)
+    if not batch_name:
+        print("Skipping batch summary update because CSV contains multiple or missing batch IDs.")
+        return
+
+    batch_record_id = get_or_create_batch_record(batch_name)
+    record = get_airtable_record(AIRTABLE_BATCH_TABLE_NAME, batch_record_id)
+    existing_notes = record.get("fields", {}).get(AIRTABLE_BATCH_NOTES_FIELD, "")
+
+    fields = {
+        AIRTABLE_BATCH_DATE_IMPORTED_FIELD: datetime.now(UTC).date().isoformat(),
+        AIRTABLE_BATCH_NOTES_FIELD: append_batch_summary(
+            existing_notes,
+            build_batch_summary(summary),
+        ),
+    }
+
+    update_airtable_record(AIRTABLE_BATCH_TABLE_NAME, batch_record_id, fields)
+    print(f"Updated batch summary: {batch_name}")
 
 
 def get_existing_gcs_paths():
@@ -367,10 +474,14 @@ def main():
     if not AIRTABLE_BASE_ID:
         raise RuntimeError("AIRTABLE_BASE_ID missing")
 
-    rows = download_results_csv()
+    rows = rows_for_import_batch(download_results_csv())
     successful_rows = [row for row in rows if row.get("status") == "success"]
     failed_rows = [row for row in rows if row.get("status") == "failed"]
 
+    if IMPORT_BATCH_ID:
+        print(f"Import batch ID filter: {IMPORT_BATCH_ID}")
+
+    print(f"Results path: gs://{BUCKET_NAME}/{RESULTS_PATH}")
     print(f"Found {len(successful_rows)} successful rows in CSV")
     print(f"Found {len(failed_rows)} failed rows in CSV")
 
@@ -463,6 +574,20 @@ def main():
                 f"Skipped {failure_duplicate_skipped} duplicate failure rows. "
                 f"Examples: {', '.join(failure_duplicate_examples)}"
             )
+
+    try:
+        update_batch_summary(rows, {
+            "successful_rows": len(successful_rows),
+            "failed_rows": len(failed_rows),
+            "imported": imported,
+            "skipped": skipped,
+            "duplicate_skipped": duplicate_skipped,
+            "failure_imported": failure_imported,
+            "failure_skipped": failure_skipped,
+            "failure_duplicate_skipped": failure_duplicate_skipped,
+        })
+    except Exception as error:
+        print(f"Batch summary update failed: {error}")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 
 ## Import Pipeline
 
-- Use per-batch result files, for example `results/batches/{import_batch_id}.csv`, so the importer does not scan one forever-growing `batch_results.csv`.
+- Done: use the end-to-end runner to write per-batch result files at `results/batches/{import_batch_id}.csv`, so the importer does not scan one forever-growing `batch_results.csv`.
 - Keep the existing legacy `results/batch_results.csv` for backward compatibility until the per-batch importer is proven.
 - Add a durable per-file state model: uploaded, queued, extracting, extracted, imported, failed, resolved.
 - Avoid moving source images before result/checkpoint writes are durable.
@@ -13,7 +13,8 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 
 ## Airtable
 
-- Update `Batches` records with run counts: uploaded, processed, imported, failed, skipped, started at, finished at.
+- Done: update `Batches` records after each import with a run summary in `Batch Notes` and `Date imported`.
+- Later: add dedicated writable count/status fields to `Batches` if Airtable becomes the longer-term operations dashboard.
 - Batch Airtable writes where safe, respecting Airtable limits.
 - Add targeted Airtable lookups instead of scanning full tables as the dataset grows.
 - Optionally link `Import Failures` records to `Batches` once the failure table has a batch link field.
@@ -26,7 +27,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 
 ## Operations
 
-- Add a single operator command/job that runs batch processing and Airtable import in sequence.
+- Done: add `run_import_pipeline.py` as the single operator command/job that runs batch processing and Airtable import in sequence.
 - Add dry-run modes for importer and failure recorder.
 - Add clearer environment documentation for Render jobs and local runs.
 - Shorten and sanitize failure messages before writing them to Airtable, especially errors containing signed URLs.

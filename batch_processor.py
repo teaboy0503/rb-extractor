@@ -206,6 +206,7 @@ def main():
     print(f"Bucket: {BUCKET_NAME}")
     print(f"Input prefix: {INPUT_PREFIX}")
     print(f"Import batch ID: {IMPORT_BATCH_ID}")
+    print(f"Results path: {RESULTS_PATH}")
     print(f"Max files: {MAX_FILES}")
     print(f"Sleep seconds: {SLEEP_SECONDS}")
     print(f"Max extractor attempts: {MAX_EXTRACTOR_ATTEMPTS}")
