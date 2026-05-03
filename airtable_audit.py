@@ -8,7 +8,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
-AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY") or os.getenv("airtable_codex_api") or ""
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "appHvUoYJgIIaBWWr")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Items")
 AIRTABLE_BATCH_TABLE_NAME = os.getenv("AIRTABLE_BATCH_TABLE_NAME", "Batches")
@@ -31,7 +31,7 @@ def meta_url():
 
 def require_config():
     if not AIRTABLE_API_KEY:
-        raise RuntimeError("Set AIRTABLE_API_KEY or airtable_codex_api before running this script")
+        raise RuntimeError("Set AIRTABLE_API_KEY before running this script")
     if not AIRTABLE_BASE_ID:
         raise RuntimeError("Set AIRTABLE_BASE_ID before running this script")
 
