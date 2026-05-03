@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
 pydantic
-httpx
 google-cloud-vision
 google-auth
 openai

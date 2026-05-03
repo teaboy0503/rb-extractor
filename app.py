@@ -3,10 +3,7 @@ import io
 import os
 import json
 import re
-from datetime import timedelta
-from typing import Optional, Dict, Any, List, Tuple
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
@@ -22,19 +19,14 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "90"))
 MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 
 app = FastAPI(title="RB Extractor", version="1.6.3-quality-flags")
 
 
 class ExtractRequest(BaseModel):
-    record_id: str
-    image_url: Optional[str] = None
-    gcs_bucket: Optional[str] = None
-    gcs_object_path: Optional[str] = None
-    item_id: Optional[str] = None
-    collection: Optional[str] = None
+    gcs_bucket: str
+    gcs_object_path: str
 
 
 def require_bearer_auth(req: Request) -> None:
@@ -70,18 +62,6 @@ def download_gcs_bytes(bucket_name, object_path):
         raise HTTPException(404, "GCS object not found")
 
     return blob.download_as_bytes()
-
-
-def generate_gcs_signed_url(bucket_name, object_path):
-    client = get_storage_client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(object_path)
-
-    return blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(hours=2),
-        method="GET",
-    )
 
 
 def fix_image_orientation(image_bytes):
@@ -235,15 +215,7 @@ def health():
 async def extract(req: Request, body: ExtractRequest):
     require_bearer_auth(req)
 
-    if body.gcs_bucket:
-        image_bytes = download_gcs_bytes(body.gcs_bucket, body.gcs_object_path)
-        image_url = generate_gcs_signed_url(body.gcs_bucket, body.gcs_object_path)
-    else:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
-            r = await client.get(body.image_url)
-            image_bytes = r.content
-        image_url = body.image_url
-
+    image_bytes = download_gcs_bytes(body.gcs_bucket, body.gcs_object_path)
     image_bytes, orientation_action = fix_image_orientation(image_bytes)
     downloaded_image_bytes = len(image_bytes)
 
@@ -268,8 +240,8 @@ async def extract(req: Request, body: ExtractRequest):
 
     return {
         "app_version": "1.6.3-quality-flags",
-        "image_source": "Google Cloud Storage" if body.gcs_bucket else "URL",
-        "image_ref": (body.gcs_object_path or "") if body.gcs_bucket else (image_url or ""),
+        "image_source": "Google Cloud Storage",
+        "image_ref": body.gcs_object_path,
         "ocr_text": ocr_text,
         "ocr_confidence": ocr_conf,
         "ocr_length": len(ocr_text),

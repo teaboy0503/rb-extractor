@@ -54,11 +54,8 @@ def list_input_blobs():
 
 def call_extractor(blob_name):
     payload = {
-        "record_id": blob_name,
         "gcs_bucket": BUCKET_NAME,
         "gcs_object_path": blob_name,
-        "item_id": "",
-        "collection": "",
     }
 
     response = requests.post(
