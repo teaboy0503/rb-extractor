@@ -151,6 +151,17 @@ def airtable_formula_string(value):
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def retry_count_for_row(row):
+    attempts = row.get("extraction_attempts")
+    if attempts in [None, ""]:
+        return 0
+
+    try:
+        return max(0, int(float(attempts)) - 1)
+    except:
+        return 0
+
+
 def get_or_create_batch_record(batch_name):
     batch_name = (batch_name or "").strip()
     if not batch_name:
@@ -328,7 +339,7 @@ def create_failure_record(row):
         "Original filename": row.get("Original filename", gcs_path.split("/")[-1]),
         "Failure stage": "Extraction",
         "Error message": row.get("error", ""),
-        "Retry count": int(float(row["extraction_attempts"])) if row.get("extraction_attempts") else None,
+        "Retry count": retry_count_for_row(row),
         "Resolved?": False,
     }
 
@@ -418,7 +429,7 @@ def main():
         imported += 1
 
     if AIRTABLE_FAILURE_TABLE_NAME:
-        for row in failed_rows:
+        for row in reversed(failed_rows):
             if failure_imported >= MAX_FAILURE_IMPORT_ROWS:
                 break
 
