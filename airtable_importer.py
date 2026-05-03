@@ -3,6 +3,7 @@ import csv
 import json
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from google.cloud import storage
@@ -14,6 +15,7 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 BUCKET_NAME = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 RESULTS_PATH = os.getenv("BATCH_RESULTS_PATH", "results/batch_results.csv")
 IMPORT_BATCH_ID = os.getenv("IMPORT_BATCH_ID", "").strip()
+IMPORT_TIMEZONE = os.getenv("IMPORT_TIMEZONE", "Europe/London")
 
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
@@ -31,6 +33,13 @@ MAX_IMPORT_ROWS = int(os.getenv("MAX_IMPORT_ROWS", "25"))
 MAX_FAILURE_IMPORT_ROWS = int(os.getenv("MAX_FAILURE_IMPORT_ROWS", str(MAX_IMPORT_ROWS)))
 
 batch_record_cache = {}
+
+try:
+    import_timezone = ZoneInfo(IMPORT_TIMEZONE)
+    import_timezone_label = IMPORT_TIMEZONE
+except ZoneInfoNotFoundError:
+    import_timezone = UTC
+    import_timezone_label = "UTC"
 
 
 def get_storage_client():
@@ -274,9 +283,9 @@ def append_batch_summary(existing_notes, summary):
 
 
 def build_batch_summary(summary):
-    timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+    timestamp = datetime.now(import_timezone).isoformat(timespec="seconds")
     return "\n".join([
-        f"Import run: {timestamp}",
+        f"Import run ({import_timezone_label}): {timestamp}",
         f"Results CSV: gs://{BUCKET_NAME}/{RESULTS_PATH}",
         f"Successful rows in CSV: {summary['successful_rows']}",
         f"Failed rows in CSV: {summary['failed_rows']}",
@@ -300,7 +309,7 @@ def update_batch_summary(rows, summary):
     existing_notes = record.get("fields", {}).get(AIRTABLE_BATCH_NOTES_FIELD, "")
 
     fields = {
-        AIRTABLE_BATCH_DATE_IMPORTED_FIELD: datetime.now(UTC).date().isoformat(),
+        AIRTABLE_BATCH_DATE_IMPORTED_FIELD: datetime.now(import_timezone).date().isoformat(),
         AIRTABLE_BATCH_NOTES_FIELD: append_batch_summary(
             existing_notes,
             build_batch_summary(summary),
