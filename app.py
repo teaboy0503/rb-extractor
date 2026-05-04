@@ -1,8 +1,10 @@
 from PIL import Image, ExifTags
+import csv
 import io
 import os
 import json
 import re
+from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -20,13 +22,30 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
+DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
+BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
+SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUTES", "60"))
+APP_VERSION = "1.7.0-operator-api"
 
-app = FastAPI(title="RB Extractor", version="1.6.3-quality-flags")
+app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
 
 class ExtractRequest(BaseModel):
     gcs_bucket: str
     gcs_object_path: str
+
+
+class CreateBatchRequest(BaseModel):
+    batch_id: str | None = None
+    source: str | None = None
+    target_collection: str | None = None
+    notes: str | None = None
+
+
+class CreateUploadUrlRequest(BaseModel):
+    filename: str
+    content_type: str = "application/octet-stream"
+    overwrite: bool = False
 
 
 def require_bearer_auth(req: Request) -> None:
@@ -53,9 +72,64 @@ def get_storage_client():
     return storage.Client(credentials=credentials, project=project_id)
 
 
+def normalize_prefix(prefix):
+    prefix = (prefix or "").strip()
+    if prefix and not prefix.endswith("/"):
+        prefix = f"{prefix}/"
+    return prefix
+
+
+def validate_batch_id(batch_id):
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$", batch_id or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="batch_id may contain only letters, numbers, dots, underscores, and hyphens",
+        )
+    return batch_id
+
+
+def make_batch_id():
+    return datetime.now(UTC).strftime("batch-%Y%m%dT%H%M%SZ")
+
+
+def batch_root_prefix(batch_id):
+    return f"{normalize_prefix(BATCH_UPLOAD_ROOT_PREFIX)}{batch_id}/"
+
+
+def batch_input_prefix(batch_id):
+    return f"{batch_root_prefix(batch_id)}to_process/"
+
+
+def batch_results_path(batch_id):
+    return f"results/batches/{batch_id}.csv"
+
+
+def batch_run_command(batch_id):
+    input_prefix = batch_input_prefix(batch_id)
+    results_path = batch_results_path(batch_id)
+    return (
+        f"IMPORT_BATCH_ID={batch_id} "
+        f"BATCH_INPUT_PREFIX={input_prefix} "
+        f"BATCH_RESULTS_PATH={results_path} "
+        "python3 run_import_pipeline.py"
+    )
+
+
+def safe_filename(filename):
+    filename = os.path.basename((filename or "").strip())
+    filename = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename)
+    filename = filename.strip(" .")
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    return filename
+
+
+def get_bucket(bucket_name=DEFAULT_GCS_BUCKET):
+    return get_storage_client().bucket(bucket_name)
+
+
 def download_gcs_bytes(bucket_name, object_path):
-    client = get_storage_client()
-    bucket = client.bucket(bucket_name)
+    bucket = get_bucket(bucket_name)
     blob = bucket.blob(object_path)
 
     if not blob.exists():
@@ -206,9 +280,146 @@ def build_extraction_messages(ocr_text):
     ]
 
 
+def batch_manifest(batch_id, body):
+    input_prefix = batch_input_prefix(batch_id)
+    results_path = batch_results_path(batch_id)
+
+    return {
+        "batch_id": batch_id,
+        "bucket": DEFAULT_GCS_BUCKET,
+        "input_prefix": input_prefix,
+        "results_path": results_path,
+        "source": body.source or "",
+        "target_collection": body.target_collection or "",
+        "notes": body.notes or "",
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_command": batch_run_command(batch_id),
+    }
+
+
+def write_batch_manifest(manifest):
+    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    manifest_path = f"{batch_root_prefix(manifest['batch_id'])}batch.json"
+    bucket.blob(manifest_path).upload_from_string(
+        json.dumps(manifest, indent=2),
+        content_type="application/json",
+    )
+    return manifest_path
+
+
+def count_batch_uploads(batch_id):
+    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    prefix = batch_input_prefix(batch_id)
+    count = 0
+
+    for blob in bucket.client.list_blobs(DEFAULT_GCS_BUCKET, prefix=prefix):
+        if not blob.name.endswith("/"):
+            count += 1
+
+    return count
+
+
+def batch_results_counts(batch_id):
+    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    blob = bucket.blob(batch_results_path(batch_id))
+
+    if not blob.exists():
+        return {
+            "exists": False,
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+        }
+
+    rows = csv.DictReader(blob.download_as_text(encoding="utf-8").splitlines())
+    counts = {
+        "exists": True,
+        "total": 0,
+        "success": 0,
+        "failed": 0,
+    }
+
+    for row in rows:
+        counts["total"] += 1
+        status = (row.get("status") or "").strip().lower()
+        if status == "success":
+            counts["success"] += 1
+        elif status == "failed":
+            counts["failed"] += 1
+
+    return counts
+
+
 @app.get("/")
 def health():
-    return {"status": "ok", "version": "1.6.3-quality-flags"}
+    return {"status": "ok", "version": APP_VERSION}
+
+
+@app.post("/batches")
+async def create_batch(req: Request, body: CreateBatchRequest):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(body.batch_id or make_batch_id())
+    manifest = batch_manifest(batch_id, body)
+    manifest_path = write_batch_manifest(manifest)
+
+    return {
+        **manifest,
+        "manifest_path": manifest_path,
+    }
+
+
+@app.post("/batches/{batch_id}/upload-url")
+async def create_batch_upload_url(req: Request, batch_id: str, body: CreateUploadUrlRequest):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(batch_id)
+    filename = safe_filename(body.filename)
+    content_type = body.content_type or "application/octet-stream"
+    object_path = f"{batch_input_prefix(batch_id)}{filename}"
+    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    blob = bucket.blob(object_path)
+
+    if blob.exists() and not body.overwrite:
+        raise HTTPException(status_code=409, detail="Object already exists")
+
+    expires_at = datetime.now(UTC) + timedelta(minutes=SIGNED_UPLOAD_EXPIRATION_MINUTES)
+    upload_url = blob.generate_signed_url(
+        version="v4",
+        expiration=expires_at,
+        method="PUT",
+        content_type=content_type,
+    )
+
+    return {
+        "batch_id": batch_id,
+        "bucket": DEFAULT_GCS_BUCKET,
+        "object_path": object_path,
+        "gcs_uri": f"gs://{DEFAULT_GCS_BUCKET}/{object_path}",
+        "upload_url": upload_url,
+        "method": "PUT",
+        "headers": {
+            "Content-Type": content_type,
+        },
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@app.get("/batches/{batch_id}")
+async def get_batch_status(req: Request, batch_id: str):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(batch_id)
+
+    return {
+        "batch_id": batch_id,
+        "bucket": DEFAULT_GCS_BUCKET,
+        "input_prefix": batch_input_prefix(batch_id),
+        "results_path": batch_results_path(batch_id),
+        "uploaded_count": count_batch_uploads(batch_id),
+        "results": batch_results_counts(batch_id),
+        "run_command": batch_run_command(batch_id),
+    }
 
 
 @app.post("/extract")
@@ -239,7 +450,7 @@ async def extract(req: Request, body: ExtractRequest):
     )
 
     return {
-        "app_version": "1.6.3-quality-flags",
+        "app_version": APP_VERSION,
         "image_source": "Google Cloud Storage",
         "image_ref": body.gcs_object_path,
         "ocr_text": ocr_text,
