@@ -16,6 +16,32 @@ AIRTABLE_FAILURE_TABLE_NAME = os.getenv("AIRTABLE_FAILURE_TABLE_NAME", "Import F
 
 DEFAULT_SAMPLE_RECORDS = int(os.getenv("AIRTABLE_AUDIT_SAMPLE_RECORDS", "200"))
 
+KNOWN_TABLES = [
+    "Items",
+    "Batches",
+    "Locations",
+    "Batch Uploads",
+    "Import Failures",
+]
+
+CLEANUP_CANDIDATES = [
+    ("Items", "Extraction queued", "Delete candidate", "Old Airtable-trigger queue flag; current pipeline starts outside Airtable."),
+    ("Items", "Rotated title page image", "Delete candidate", "Legacy attachment field; orientation is handled inside the extractor response/debug path."),
+    ("Items", "GCS object path-old", "Hide, then delete", "Formula/computed legacy path; current importer writes to GCS object path."),
+    ("Items", "Batch ID", "Review before deleting", "Formula convenience field. Keep if views depend on it; pipeline uses Related Batch instead."),
+    ("Items", "Image processing notes", "Review", "May still be useful for human QA, but current import routine does not write it."),
+    ("Batches", "Items", "Delete candidate", "Legacy plain text field; linked records should be the source of truth."),
+    ("Batches", "Batch Uploads", "Delete candidate", "Old Airtable-upload workflow link."),
+    ("Batches", "Batch Uploads 2", "Delete candidate", "Duplicate old Airtable-upload workflow link."),
+    ("Batches", "Items 2", "Keep, consider rename", "Likely reciprocal link for Items -> Related Batch. Rename to Items after old Items field is removed."),
+    ("Batch Uploads", "Images", "Retire with table", "Old Airtable attachment upload workflow; current uploads should go to GCS."),
+    ("Batch Uploads", "Processed", "Retire with table", "Old Airtable attachment workflow status."),
+    ("Batch Uploads", "Processed count", "Retire with table", "Old Airtable attachment workflow count."),
+    ("Batch Uploads", "Processed timestamp", "Retire with table", "Old Airtable attachment workflow timestamp."),
+    ("Locations", "Items", "Consolidate", "Likely one of two reciprocal item-location links."),
+    ("Locations", "Items 2", "Consolidate", "Likely duplicate reciprocal link from newer location field."),
+]
+
 
 def headers():
     return {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
@@ -53,6 +79,13 @@ def request_json(method, url, params=None):
 def fetch_schema():
     data = request_json("GET", meta_url())
     return data.get("tables", [])
+
+
+def fetch_schema_if_allowed():
+    try:
+        return fetch_schema(), None
+    except RuntimeError as error:
+        return [], str(error)
 
 
 def table_by_name(schema, table_name):
@@ -207,20 +240,17 @@ def check_item_record(record, expected_batch_id):
     return issues
 
 
-def field_usage(records, table):
-    usage = {}
-    for field_name in field_names(table):
-        count = 0
-        for record in records:
-            if is_non_empty(record.get("fields", {}).get(field_name)):
-                count += 1
-        usage[field_name] = count
-    return usage
+def usage_count(records, field_name):
+    count = 0
+    for record in records:
+        if is_non_empty(record.get("fields", {}).get(field_name)):
+            count += 1
+    return count
 
 
-def format_usage(usage, field_name, sample_size):
-    count = usage.get(field_name, 0)
-    return f"{count}/{sample_size} sampled records populated"
+def format_usage(records, field_name):
+    count = usage_count(records, field_name)
+    return f"{count}/{len(records)} sampled records populated"
 
 
 def cleanup_recommendations(schema, sampled_records):
@@ -228,37 +258,20 @@ def cleanup_recommendations(schema, sampled_records):
 
     def add(table_name, field_name, action, reason):
         table = table_by_name(schema, table_name)
-        if not table or field_name not in field_names(table):
+        if schema and (not table or field_name not in field_names(table)):
             return
-        usage = field_usage(sampled_records.get(table_name, []), table)
-        sample_size = len(sampled_records.get(table_name, []))
+        records = sampled_records.get(table_name, [])
         recommendations.append({
             "table": table_name,
             "field": field_name,
-            "type": field_type(table, field_name),
+            "type": field_type(table, field_name) if table else "unknown without schema scope",
             "action": action,
-            "usage": format_usage(usage, field_name, sample_size),
+            "usage": format_usage(records, field_name),
             "reason": reason,
         })
 
-    add("Items", "Extraction queued", "Delete candidate", "Old Airtable-trigger queue flag; current pipeline starts outside Airtable.")
-    add("Items", "Rotated title page image", "Delete candidate", "Legacy attachment field; orientation is handled inside the extractor response/debug path.")
-    add("Items", "GCS object path-old", "Hide, then delete", "Formula/computed legacy path; current importer writes to GCS object path.")
-    add("Items", "Batch ID", "Review before deleting", "Formula convenience field. Keep if views depend on it; pipeline uses Related Batch instead.")
-    add("Items", "Image processing notes", "Review", "May still be useful for human QA, but current import routine does not write it.")
-
-    add("Batches", "Items", "Delete candidate", "Legacy plain text field; linked records should be the source of truth.")
-    add("Batches", "Batch Uploads", "Delete candidate", "Old Airtable-upload workflow link.")
-    add("Batches", "Batch Uploads 2", "Delete candidate", "Duplicate old Airtable-upload workflow link.")
-    add("Batches", "Items 2", "Keep, consider rename", "Likely reciprocal link for Items -> Related Batch. Rename to Items after old Items field is removed.")
-
-    add("Batch Uploads", "Images", "Retire with table", "Old Airtable attachment upload workflow; current uploads should go to GCS.")
-    add("Batch Uploads", "Processed", "Retire with table", "Old Airtable attachment workflow status.")
-    add("Batch Uploads", "Processed count", "Retire with table", "Old Airtable attachment workflow count.")
-    add("Batch Uploads", "Processed timestamp", "Retire with table", "Old Airtable attachment workflow timestamp.")
-
-    add("Locations", "Items", "Consolidate", "Likely one of two reciprocal item-location links.")
-    add("Locations", "Items 2", "Consolidate", "Likely duplicate reciprocal link from newer location field.")
+    for table_name, field_name, action, reason in CLEANUP_CANDIDATES:
+        add(table_name, field_name, action, reason)
 
     return recommendations
 
@@ -307,7 +320,7 @@ def print_latest_import_report(schema):
     elif item_ids and len(item_ids) > len(checked_items):
         print(f"Checked first {len(checked_items)} of {len(item_ids)} linked item record(s).")
 
-    if table_by_name(schema, AIRTABLE_FAILURE_TABLE_NAME):
+    if table_by_name(schema, AIRTABLE_FAILURE_TABLE_NAME) or not schema:
         failures = list_records_with_fallback(
             AIRTABLE_FAILURE_TABLE_NAME,
             max_records=50,
@@ -332,6 +345,8 @@ def print_latest_import_report(schema):
 def print_schema_cleanup_report(schema, sample_records):
     print("\n== Schema Cleanup Suggestions ==")
     print("These are recommendations only. Hide fields first, then delete after views/scripts are checked.")
+    if not schema:
+        print("Schema metadata was unavailable, so field types and always-empty fields cannot be verified exactly.")
 
     for recommendation in cleanup_recommendations(schema, sample_records):
         print(
@@ -350,9 +365,27 @@ def print_schema_cleanup_report(schema, sample_records):
 
 def print_table_overview(schema, sample_records):
     print("\n== Table Overview ==")
-    for table in schema:
-        records = sample_records.get(table["name"], [])
-        print(f"- {table['name']}: {len(table.get('fields', []))} fields, sampled {len(records)} records")
+    if schema:
+        for table in schema:
+            records = sample_records.get(table["name"], [])
+            print(f"- {table['name']}: {len(table.get('fields', []))} fields, sampled {len(records)} records")
+        return
+
+    for table_name, records in sample_records.items():
+        populated_fields = sorted({
+            field_name
+            for record in records
+            for field_name in record.get("fields", {})
+        })
+        print(f"- {table_name}: schema unavailable, sampled {len(records)} records, saw {len(populated_fields)} populated fields")
+
+
+def sample_table_records(table_name, sample_records):
+    try:
+        return list_records_with_fallback(table_name, max_records=sample_records)
+    except RuntimeError as error:
+        print(f"Skipping table sample for {table_name}: {error}")
+        return []
 
 
 def parse_args():
@@ -370,15 +403,19 @@ def main():
     args = parse_args()
     require_config()
 
-    schema = fetch_schema()
+    schema, schema_error = fetch_schema_if_allowed()
     sample_records = {}
 
-    for table in schema:
-        table_name = table["name"]
-        sample_records[table_name] = list_records_with_fallback(
-            table_name,
-            max_records=args.sample_records,
-        )
+    if schema_error:
+        print("Schema metadata unavailable.")
+        print("For exact field/type cleanup, add Airtable token scope: schema.bases:read.")
+        print("Continuing with record-level audit only.")
+        print(f"Metadata error: {schema_error}")
+
+    table_names = [table["name"] for table in schema] if schema else KNOWN_TABLES
+
+    for table_name in table_names:
+        sample_records[table_name] = sample_table_records(table_name, args.sample_records)
 
     print(f"Airtable base: {AIRTABLE_BASE_ID}")
     print_table_overview(schema, sample_records)
