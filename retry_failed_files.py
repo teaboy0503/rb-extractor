@@ -11,6 +11,8 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 BUCKET_NAME = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 FAILED_PREFIX = os.getenv("BATCH_FAILED_PREFIX", "failed/")
+PROCESSED_PREFIX = os.getenv("BATCH_PROCESSED_PREFIX", "processed/")
+DEFAULT_INPUT_PREFIX = os.getenv("BATCH_INPUT_PREFIX", "to_process/")
 RETRY_BATCH_ID = os.getenv("RETRY_BATCH_ID") or datetime.now(UTC).strftime("retry-%Y%m%dT%H%M%SZ")
 INPUT_PREFIX = os.getenv("RETRY_INPUT_PREFIX", f"to_process/{RETRY_BATCH_ID}/")
 
@@ -32,6 +34,8 @@ def normalize_prefix(prefix):
 
 
 FAILED_PREFIX = normalize_prefix(FAILED_PREFIX)
+PROCESSED_PREFIX = normalize_prefix(PROCESSED_PREFIX)
+DEFAULT_INPUT_PREFIX = normalize_prefix(DEFAULT_INPUT_PREFIX)
 INPUT_PREFIX = normalize_prefix(INPUT_PREFIX)
 
 
@@ -156,6 +160,9 @@ def path_candidates(fields):
 
     if filename:
         add(f"{FAILED_PREFIX}{filename}")
+        add(f"{DEFAULT_INPUT_PREFIX}{filename}")
+        add(f"{PROCESSED_PREFIX}{filename}")
+        add(f"{INPUT_PREFIX}{filename}")
 
     if raw_path.startswith("to_process/") and filename:
         add(f"{FAILED_PREFIX}{filename}")
@@ -164,6 +171,14 @@ def path_candidates(fields):
         add(f"{FAILED_PREFIX}{filename}")
 
     return candidates
+
+
+def blob_location_status(blob):
+    if blob.name.startswith(PROCESSED_PREFIX):
+        return "already_processed"
+    if blob.name.startswith(DEFAULT_INPUT_PREFIX) or blob.name.startswith(INPUT_PREFIX):
+        return "already_queued"
+    return "found_source"
 
 
 def resolve_source_blob(bucket, fields):
@@ -199,6 +214,17 @@ def move_for_retry(bucket, record, apply_changes, mark_resolved):
                 mark_failure_resolved(record["id"])
             return "already_queued", "", destination_path
         return "missing_source", "", destination_path
+
+    location_status = blob_location_status(source_blob)
+    if location_status == "already_processed":
+        if apply_changes and mark_resolved:
+            mark_failure_resolved(record["id"])
+        return location_status, source_blob.name, source_blob.name
+
+    if location_status == "already_queued" and source_blob.name.startswith(INPUT_PREFIX):
+        if apply_changes and mark_resolved:
+            mark_failure_resolved(record["id"])
+        return location_status, source_blob.name, source_blob.name
 
     destination_path = destination_path_for_blob(source_blob)
     destination_blob = bucket.blob(destination_path)
@@ -252,6 +278,8 @@ def main():
     print("== Retry Failed Files ==")
     print(f"Bucket: {BUCKET_NAME}")
     print(f"Failed prefix: {FAILED_PREFIX}")
+    print(f"Processed prefix: {PROCESSED_PREFIX}")
+    print(f"Default input prefix: {DEFAULT_INPUT_PREFIX}")
     print(f"Input prefix: {INPUT_PREFIX}")
     print(f"Retry batch ID: {RETRY_BATCH_ID}")
     print(f"Max files: {args.max_files}")
@@ -276,7 +304,10 @@ def main():
             action = "Queued" if args.apply else "Would queue"
             print(f"{action}: {filename}: {source_path} -> {destination_path}")
         elif status == "already_queued":
-            print(f"Already queued: {filename}: {destination_path}")
+            print(f"Already queued: {filename}: {source_path or destination_path}")
+        elif status == "already_processed":
+            action = "Resolved" if args.apply and mark_resolved else "Already processed"
+            print(f"{action}: {filename}: {source_path}")
         elif status == "destination_exists":
             print(f"Destination exists, skipped move: {filename}: {destination_path}")
         else:
