@@ -106,7 +106,11 @@ def field_type(table, field_name):
     return ""
 
 
-def list_records(table_name, max_records=100, sort=None):
+def airtable_formula_string(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def list_records(table_name, max_records=100, sort=None, formula=None):
     records = []
     offset = None
 
@@ -115,6 +119,9 @@ def list_records(table_name, max_records=100, sort=None):
 
         if offset:
             params["offset"] = offset
+
+        if formula:
+            params["filterByFormula"] = formula
 
         for index, sort_item in enumerate(sort or []):
             params[f"sort[{index}][field]"] = sort_item[0]
@@ -130,13 +137,23 @@ def list_records(table_name, max_records=100, sort=None):
     return records
 
 
-def list_records_with_fallback(table_name, max_records=100, sort=None):
+def list_records_with_fallback(table_name, max_records=100, sort=None, formula=None):
     try:
-        return list_records(table_name, max_records=max_records, sort=sort)
+        return list_records(
+            table_name,
+            max_records=max_records,
+            sort=sort,
+            formula=formula,
+        )
     except RuntimeError:
         if not sort:
             raise
-        return list_records(table_name, max_records=max_records, sort=None)
+        return list_records(
+            table_name,
+            max_records=max_records,
+            sort=None,
+            formula=formula,
+        )
 
 
 def get_record(table_name, record_id):
@@ -200,6 +217,35 @@ def linked_record_ids(fields, name_prefix):
             if record_id not in ids:
                 ids.append(record_id)
     return ids
+
+
+def item_records_for_batch(batch_id, batch_name):
+    if not batch_name:
+        return []
+
+    formula = (
+        f"FIND({airtable_formula_string(batch_name)}, "
+        f"ARRAYJOIN({{Related Batch}})) > 0"
+    )
+
+    try:
+        records = list_records_with_fallback(
+            AIRTABLE_TABLE_NAME,
+            max_records=100,
+            sort=[("Created Date", "desc")],
+            formula=formula,
+        )
+    except RuntimeError as error:
+        print(f"Could not query Items by Related Batch: {error}")
+        return []
+
+    if not batch_id:
+        return records
+
+    return [
+        record for record in records
+        if batch_id in record.get("fields", {}).get("Related Batch", [])
+    ]
 
 
 def check_item_record(record, expected_batch_id):
@@ -286,11 +332,13 @@ def print_latest_import_report(schema):
     batch_fields = latest_batch.get("fields", {})
     batch_id = latest_batch["id"]
     batch_name = batch_fields.get("Batch name", "")
-    item_ids = linked_record_ids(batch_fields, "Items")
+    batch_side_item_ids = linked_record_ids(batch_fields, "Items")
+    item_side_records = item_records_for_batch(batch_id, batch_name)
 
     print(f"Latest batch: {batch_name} ({batch_id})")
     print(f"Date imported: {batch_fields.get('Date imported', '')}")
-    print(f"Linked item records: {len(item_ids)}")
+    print(f"Batch-side linked item records: {len(batch_side_item_ids)}")
+    print(f"Item-side Related Batch records: {len(item_side_records)}")
 
     if "Item count" in batch_fields:
         print(f"Airtable Item count: {batch_fields.get('Item count')}")
@@ -300,9 +348,12 @@ def print_latest_import_report(schema):
         print("Latest Batch Notes entry:")
         print(notes.split("\n\n")[-1])
 
-    checked_items = []
-    for item_id in item_ids[:25]:
-        checked_items.append(get_record(AIRTABLE_TABLE_NAME, item_id))
+    checked_items = item_side_records[:25]
+    if not checked_items:
+        checked_items = [
+            get_record(AIRTABLE_TABLE_NAME, item_id)
+            for item_id in batch_side_item_ids[:25]
+        ]
 
     issue_count = 0
     for record in checked_items:
@@ -317,8 +368,13 @@ def print_latest_import_report(schema):
 
     if checked_items and issue_count == 0:
         print(f"Checked {len(checked_items)} linked item record(s): no obvious issues.")
-    elif item_ids and len(item_ids) > len(checked_items):
-        print(f"Checked first {len(checked_items)} of {len(item_ids)} linked item record(s).")
+    elif item_side_records and len(item_side_records) > len(checked_items):
+        print(f"Checked first {len(checked_items)} of {len(item_side_records)} item-side linked record(s).")
+    elif batch_side_item_ids and len(batch_side_item_ids) > len(checked_items):
+        print(f"Checked first {len(checked_items)} of {len(batch_side_item_ids)} batch-side linked record(s).")
+
+    if not batch_side_item_ids and item_side_records:
+        print("Note: Items are linked from the Items side, but the Batches reciprocal field is absent or renamed.")
 
     if table_by_name(schema, AIRTABLE_FAILURE_TABLE_NAME) or not schema:
         failures = list_records_with_fallback(
@@ -359,7 +415,8 @@ def print_schema_cleanup_report(schema, sample_records):
     print("\nKeep for current pipeline:")
     print("- Items -> Title page image, GCS bucket, GCS object path, Original filename")
     print("- Items -> OCR/extraction fields, Extraction status, Processing status, Related Batch")
-    print("- Batches -> Batch name, Date imported, Batch Notes, Item count, Items 2")
+    print("- Batches -> Batch name, Date imported, Batch Notes, Item count")
+    print("- Batches -> reciprocal linked Items field, if you want batch views in Airtable")
     print("- Import Failures -> all current fields")
 
 
