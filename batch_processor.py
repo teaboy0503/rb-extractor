@@ -26,12 +26,17 @@ MAX_FILES = int(os.getenv("MAX_FILES", "3"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1.5"))
 MAX_EXTRACTOR_ATTEMPTS = max(1, int(os.getenv("MAX_EXTRACTOR_ATTEMPTS", "3")))
 RETRY_SLEEP_SECONDS = float(os.getenv("RETRY_SLEEP_SECONDS", "5"))
+MIN_SUCCESS_OCR_LENGTH = int(os.getenv("MIN_SUCCESS_OCR_LENGTH", "20"))
 
 
 class ExtractorError(RuntimeError):
     def __init__(self, status_code, response_text):
         self.status_code = status_code
         super().__init__(f"Extractor error {status_code}: {response_text}")
+
+
+class ExtractionQualityError(RuntimeError):
+    pass
 
 
 def get_storage_client():
@@ -96,6 +101,22 @@ def call_extractor_with_retries(blob_name):
             time.sleep(RETRY_SLEEP_SECONDS * attempt)
 
     raise last_error
+
+
+def int_value(value, default=0):
+    try:
+        return int(float(value))
+    except:
+        return default
+
+
+def validate_extraction_quality(data):
+    ocr_length = int_value(data.get("ocr_length"))
+    if ocr_length < MIN_SUCCESS_OCR_LENGTH:
+        raise ExtractionQualityError(
+            f"OCR text too short: {ocr_length} characters "
+            f"(minimum {MIN_SUCCESS_OCR_LENGTH})"
+        )
 
 
 def move_blob(blob, destination_prefix):
@@ -210,6 +231,7 @@ def main():
     print(f"Max files: {MAX_FILES}")
     print(f"Sleep seconds: {SLEEP_SECONDS}")
     print(f"Max extractor attempts: {MAX_EXTRACTOR_ATTEMPTS}")
+    print(f"Minimum success OCR length: {MIN_SUCCESS_OCR_LENGTH}")
 
     blobs = list_input_blobs()
     print(f"Found {len(blobs)} file(s) to process")
@@ -239,6 +261,7 @@ def main():
 
         try:
             data, attempts = call_extractor_with_retries(source_path)
+            validate_extraction_quality(data)
             final_path = move_blob(blob, PROCESSED_PREFIX)
 
             rows.append(result_row_success(source_path, final_path, data, attempts))

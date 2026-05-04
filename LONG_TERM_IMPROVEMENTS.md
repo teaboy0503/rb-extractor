@@ -9,6 +9,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 - Add a durable per-file state model: uploaded, queued, extracting, extracted, imported, failed, resolved.
 - Avoid moving source images before result/checkpoint writes are durable.
 - Preserve relative source paths or add collision-resistant destination names so duplicate filenames cannot overwrite each other.
+- Done: reject extractor successes with very short OCR text so blank records become import failures instead.
 - Done: add a controlled retry workflow for files in `failed/`, including moving selected files back to `to_process/` and marking matching failure records resolved.
 
 ## Airtable
