@@ -27,6 +27,7 @@ AIRTABLE_BATCH_NOTES_FIELD = os.getenv("AIRTABLE_BATCH_NOTES_FIELD", "Batch Note
 AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Related Batch")
 AIRTABLE_FAILURE_TABLE_NAME = os.getenv("AIRTABLE_FAILURE_TABLE_NAME", "")
 AIRTABLE_FAILURE_BATCH_LINK_FIELD = os.getenv("AIRTABLE_FAILURE_BATCH_LINK_FIELD", "")
+AIRTABLE_FAILURE_RESOLVED_FIELD = os.getenv("AIRTABLE_FAILURE_RESOLVED_FIELD", "Resolved?")
 AIRTABLE_QUALITY_FLAGS_FIELD = os.getenv("AIRTABLE_QUALITY_FLAGS_FIELD", "")
 
 MAX_IMPORT_ROWS = int(os.getenv("MAX_IMPORT_ROWS", "25"))
@@ -370,7 +371,11 @@ def get_existing_failure_paths():
         data = response.json()
 
         for record in data.get("records", []):
-            path = record.get("fields", {}).get("GCS object path")
+            fields = record.get("fields", {})
+            if fields.get(AIRTABLE_FAILURE_RESOLVED_FIELD):
+                continue
+
+            path = fields.get("GCS object path")
             if path:
                 existing.add(path)
 
@@ -456,7 +461,7 @@ def create_failure_record(row):
         "Failure stage": "Extraction",
         "Error message": row.get("error", ""),
         "Retry count": retry_count_for_row(row),
-        "Resolved?": False,
+        AIRTABLE_FAILURE_RESOLVED_FIELD: False,
     }
 
     if batch_record_id and AIRTABLE_FAILURE_BATCH_LINK_FIELD:
