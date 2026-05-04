@@ -157,6 +157,10 @@ def airtable_record_url(table_name, record_id):
     return f"{airtable_url(table_name)}/{record_id}"
 
 
+def airtable_meta_url():
+    return f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
+
+
 def airtable_headers():
     return {
         "Authorization": f"Bearer {AIRTABLE_API_KEY}",
@@ -246,6 +250,42 @@ def update_airtable_record(table_name, record_id, fields):
         raise RuntimeError(f"Airtable record update error {response.status_code}: {response.text}")
 
     return response.json()
+
+
+def validate_required_airtable_fields():
+    response = requests.get(
+        airtable_meta_url(),
+        headers=airtable_headers(),
+        timeout=60,
+    )
+
+    if response.status_code == 403:
+        print("Skipping Airtable schema validation because token lacks schema.bases:read.")
+        return
+
+    if not response.ok:
+        raise RuntimeError(f"Airtable schema read error {response.status_code}: {response.text}")
+
+    tables = response.json().get("tables", [])
+
+    def table_fields(table_name):
+        for table in tables:
+            if table.get("name") == table_name:
+                return {field.get("name") for field in table.get("fields", [])}
+        raise RuntimeError(f"Airtable table not found: {table_name}")
+
+    items_fields = table_fields(AIRTABLE_TABLE_NAME)
+    missing = []
+
+    if AIRTABLE_ITEM_BATCH_LINK_FIELD not in items_fields:
+        missing.append(f"{AIRTABLE_TABLE_NAME} -> {AIRTABLE_ITEM_BATCH_LINK_FIELD}")
+
+    if missing:
+        raise RuntimeError(
+            "Missing required Airtable field(s): "
+            + ", ".join(missing)
+            + ". Recreate the field(s) or update the matching AIRTABLE_* env var."
+        )
 
 
 def rows_for_import_batch(rows):
@@ -487,6 +527,8 @@ def main():
         raise RuntimeError("AIRTABLE_API_KEY missing")
     if not AIRTABLE_BASE_ID:
         raise RuntimeError("AIRTABLE_BASE_ID missing")
+
+    validate_required_airtable_fields()
 
     rows = rows_for_import_batch(download_results_csv())
     successful_rows = [row for row in rows if row.get("status") == "success"]

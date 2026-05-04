@@ -13,6 +13,7 @@ AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "appHvUoYJgIIaBWWr")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Items")
 AIRTABLE_BATCH_TABLE_NAME = os.getenv("AIRTABLE_BATCH_TABLE_NAME", "Batches")
 AIRTABLE_FAILURE_TABLE_NAME = os.getenv("AIRTABLE_FAILURE_TABLE_NAME", "Import Failures")
+AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Related Batch")
 
 DEFAULT_SAMPLE_RECORDS = int(os.getenv("AIRTABLE_AUDIT_SAMPLE_RECORDS", "200"))
 
@@ -28,8 +29,9 @@ CLEANUP_CANDIDATES = [
     ("Items", "Extraction queued", "Delete candidate", "Old Airtable-trigger queue flag; current pipeline starts outside Airtable."),
     ("Items", "Rotated title page image", "Delete candidate", "Legacy attachment field; orientation is handled inside the extractor response/debug path."),
     ("Items", "GCS object path-old", "Hide, then delete", "Formula/computed legacy path; current importer writes to GCS object path."),
-    ("Items", "Batch ID", "Review before deleting", "Formula convenience field. Keep if views depend on it; pipeline uses Related Batch instead."),
+    ("Items", "Batch ID", "Review before deleting", "Formula convenience field. Keep if views depend on it; pipeline uses the linked batch field instead."),
     ("Items", "Image processing notes", "Review", "May still be useful for human QA, but current import routine does not write it."),
+    ("Items", "Related Batch", "Required for current pipeline", "Importer writes this linked-record field unless AIRTABLE_ITEM_BATCH_LINK_FIELD points elsewhere."),
     ("Batches", "Items", "Delete candidate", "Legacy plain text field; linked records should be the source of truth."),
     ("Batches", "Batch Uploads", "Delete candidate", "Old Airtable-upload workflow link."),
     ("Batches", "Batch Uploads 2", "Delete candidate", "Duplicate old Airtable-upload workflow link."),
@@ -104,6 +106,13 @@ def field_type(table, field_name):
         if field.get("name") == field_name:
             return field.get("type", "")
     return ""
+
+
+def has_field(schema, table_name, field_name):
+    table = table_by_name(schema, table_name)
+    if not table:
+        return False
+    return field_name in field_names(table)
 
 
 def airtable_formula_string(value):
@@ -219,13 +228,24 @@ def linked_record_ids(fields, name_prefix):
     return ids
 
 
-def item_records_for_batch(batch_id, batch_name):
+def item_records_for_batch(schema, batch_id, batch_name):
     if not batch_name:
+        return []
+
+    if schema and not has_field(schema, AIRTABLE_TABLE_NAME, AIRTABLE_ITEM_BATCH_LINK_FIELD):
+        print(
+            f"Missing item batch link field: {AIRTABLE_TABLE_NAME} -> "
+            f"{AIRTABLE_ITEM_BATCH_LINK_FIELD}"
+        )
+        print(
+            "Future imports will not be able to link Items to Batches until "
+            "this field is recreated or AIRTABLE_ITEM_BATCH_LINK_FIELD is updated."
+        )
         return []
 
     formula = (
         f"FIND({airtable_formula_string(batch_name)}, "
-        f"ARRAYJOIN({{Related Batch}})) > 0"
+        f"ARRAYJOIN({{{AIRTABLE_ITEM_BATCH_LINK_FIELD}}})) > 0"
     )
 
     try:
@@ -236,7 +256,7 @@ def item_records_for_batch(batch_id, batch_name):
             formula=formula,
         )
     except RuntimeError as error:
-        print(f"Could not query Items by Related Batch: {error}")
+        print(f"Could not query Items by {AIRTABLE_ITEM_BATCH_LINK_FIELD}: {error}")
         return []
 
     if not batch_id:
@@ -244,7 +264,7 @@ def item_records_for_batch(batch_id, batch_name):
 
     return [
         record for record in records
-        if batch_id in record.get("fields", {}).get("Related Batch", [])
+        if batch_id in record.get("fields", {}).get(AIRTABLE_ITEM_BATCH_LINK_FIELD, [])
     ]
 
 
@@ -259,7 +279,7 @@ def check_item_record(record, expected_batch_id):
         "Original filename",
         "OCR raw text",
         "Extraction JSON",
-        "Related Batch",
+        AIRTABLE_ITEM_BATCH_LINK_FIELD,
     ]
 
     for field_name in required_fields:
@@ -279,9 +299,9 @@ def check_item_record(record, expected_batch_id):
     ):
         issues.append(f"GCS object path does not look processed: {gcs_path}")
 
-    related_batches = fields.get("Related Batch", [])
+    related_batches = fields.get(AIRTABLE_ITEM_BATCH_LINK_FIELD, [])
     if expected_batch_id and expected_batch_id not in related_batches:
-        issues.append("Related Batch does not include latest batch record")
+        issues.append(f"{AIRTABLE_ITEM_BATCH_LINK_FIELD} does not include latest batch record")
 
     return issues
 
@@ -333,12 +353,12 @@ def print_latest_import_report(schema):
     batch_id = latest_batch["id"]
     batch_name = batch_fields.get("Batch name", "")
     batch_side_item_ids = linked_record_ids(batch_fields, "Items")
-    item_side_records = item_records_for_batch(batch_id, batch_name)
+    item_side_records = item_records_for_batch(schema, batch_id, batch_name)
 
     print(f"Latest batch: {batch_name} ({batch_id})")
     print(f"Date imported: {batch_fields.get('Date imported', '')}")
     print(f"Batch-side linked item records: {len(batch_side_item_ids)}")
-    print(f"Item-side Related Batch records: {len(item_side_records)}")
+    print(f"Item-side {AIRTABLE_ITEM_BATCH_LINK_FIELD} records: {len(item_side_records)}")
 
     if "Item count" in batch_fields:
         print(f"Airtable Item count: {batch_fields.get('Item count')}")
@@ -414,7 +434,7 @@ def print_schema_cleanup_report(schema, sample_records):
 
     print("\nKeep for current pipeline:")
     print("- Items -> Title page image, GCS bucket, GCS object path, Original filename")
-    print("- Items -> OCR/extraction fields, Extraction status, Processing status, Related Batch")
+    print(f"- Items -> OCR/extraction fields, Extraction status, Processing status, {AIRTABLE_ITEM_BATCH_LINK_FIELD}")
     print("- Batches -> Batch name, Date imported, Batch Notes, Item count")
     print("- Batches -> reciprocal linked Items field, if you want batch views in Airtable")
     print("- Import Failures -> all current fields")
