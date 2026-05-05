@@ -408,6 +408,63 @@ OPERATOR_UI_HTML = """<!doctype html>
       font-size: 11px;
     }
 
+    .step-list {
+      display: grid;
+      gap: 8px;
+      margin: 10px 0 12px;
+    }
+
+    .step-row {
+      display: grid;
+      grid-template-columns: 18px minmax(0, 1fr);
+      gap: 8px;
+      align-items: start;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .step-dot {
+      width: 10px;
+      height: 10px;
+      margin-top: 4px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #ffffff;
+    }
+
+    .step-row.done .step-dot {
+      border-color: var(--ok);
+      background: var(--ok);
+    }
+
+    .step-row.active {
+      color: var(--ink);
+      font-weight: 650;
+    }
+
+    .step-row.active .step-dot {
+      border-color: var(--accent);
+      background: var(--accent);
+    }
+
+    .step-row.error {
+      color: var(--danger);
+      font-weight: 650;
+    }
+
+    .step-row.error .step-dot {
+      border-color: var(--danger);
+      background: var(--danger);
+    }
+
+    .step-meta {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+      overflow-wrap: anywhere;
+    }
+
     .hidden {
       display: none;
     }
@@ -609,6 +666,7 @@ OPERATOR_UI_HTML = """<!doctype html>
             </div>
           </div>
           <div id="runStatus" class="status-line"></div>
+          <div id="runSteps" class="step-list"></div>
           <div class="command-box">
             <pre id="runCommand">Create a batch to generate the command.</pre>
           </div>
@@ -670,6 +728,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       fileList: el("fileList"),
       runBatchBtn: el("runBatchBtn"),
       runStatus: el("runStatus"),
+      runSteps: el("runSteps"),
       runCommand: el("runCommand"),
       runLog: el("runLog"),
       copyCommandBtn: el("copyCommandBtn")
@@ -802,11 +861,115 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
     }
 
+    function runStageLabel(stage) {
+      const labels = {
+        not_started: "Not started",
+        queued: "Queued",
+        starting: "Starting",
+        batch_processor: "Batch processor",
+        extracting: "Extracting files",
+        results_written: "Results CSV written",
+        airtable_importer: "Airtable import",
+        airtable_summary: "Updating batch summary",
+        complete: "Complete",
+        failed: "Failed",
+        unknown: "Unknown"
+      };
+      return labels[stage] || labels.unknown;
+    }
+
+    function runStageIndex(stage) {
+      const indexes = {
+        not_started: 0,
+        queued: 0,
+        starting: 0,
+        batch_processor: 1,
+        extracting: 2,
+        results_written: 2,
+        airtable_importer: 3,
+        airtable_summary: 3,
+        complete: 4,
+        failed: 4
+      };
+      return indexes[stage] ?? 0;
+    }
+
+    function renderRunSteps(run) {
+      const status = run?.status || "not_started";
+      const stage = run?.stage || status;
+      const activeIndex = runStageIndex(stage);
+      const filesFound = run?.files_found;
+      const processed = run?.files_processed ?? 0;
+      const succeeded = run?.files_succeeded ?? 0;
+      const failed = run?.files_failed ?? 0;
+
+      const fileProgress = filesFound !== "" && filesFound !== undefined
+        ? `${processed}/${filesFound} files checked, ${succeeded} success, ${failed} failed`
+        : "";
+
+      const steps = [
+        {
+          label: "Queued",
+          meta: run?.started_at ? `Started ${formatBatchDate(run.started_at)}` : ""
+        },
+        {
+          label: "Batch processor",
+          meta: filesFound !== "" && filesFound !== undefined ? `${filesFound} files found` : ""
+        },
+        {
+          label: "Extracting files",
+          meta: run?.current_file || fileProgress
+        },
+        {
+          label: "Airtable import",
+          meta: run?.imported_records !== "" && run?.imported_records !== undefined
+            ? `${run.imported_records} records imported`
+            : ""
+        },
+        {
+          label: "Complete",
+          meta: run?.finished_at ? `Finished ${formatBatchDate(run.finished_at)}` : ""
+        }
+      ];
+
+      nodes.runSteps.innerHTML = "";
+      for (const [index, step] of steps.entries()) {
+        const row = document.createElement("div");
+        let className = "step-row";
+        if (status === "failed" && index === activeIndex) {
+          className += " error";
+        } else if (status === "succeeded" || index < activeIndex) {
+          className += " done";
+        } else if (status === "running" && index === activeIndex) {
+          className += " active";
+        }
+        row.className = className;
+
+        const dot = document.createElement("div");
+        dot.className = "step-dot";
+
+        const content = document.createElement("div");
+        const label = document.createElement("div");
+        label.textContent = step.label;
+        content.appendChild(label);
+
+        if (step.meta) {
+          const meta = document.createElement("div");
+          meta.className = "step-meta";
+          meta.textContent = step.meta;
+          content.appendChild(meta);
+        }
+
+        row.append(dot, content);
+        nodes.runSteps.appendChild(row);
+      }
+    }
+
     function renderRunStatus(run) {
       const status = run?.status || "not_started";
 
       if (status === "running") {
-        setStatus(nodes.runStatus, "Batch is running. This page will refresh status automatically.", "warn");
+        setStatus(nodes.runStatus, `Batch is running: ${runStageLabel(run?.stage)}.`, "warn");
         setRunPolling(true);
       } else if (status === "succeeded") {
         setStatus(nodes.runStatus, "Batch run finished successfully.", "ok");
@@ -819,6 +982,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         setRunPolling(false);
       }
 
+      renderRunSteps(run);
       const logTail = (run?.log_tail || "").trim();
       if (logTail) {
         nodes.runLog.textContent = logTail;

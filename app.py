@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
@@ -31,7 +32,7 @@ MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
 SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUTES", "60"))
-APP_VERSION = "1.9.0-operator-run"
+APP_VERSION = "1.10.0-operator-progress"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -432,6 +433,7 @@ def read_batch_run_status(batch_id, bucket=None):
         return {
             "status": "not_started",
             "log_path": batch_run_log_path(batch_id),
+            **initial_run_progress("not_started"),
         }
 
     try:
@@ -441,6 +443,7 @@ def read_batch_run_status(batch_id, bucket=None):
             "status": "unknown",
             "log_path": batch_run_log_path(batch_id),
             "error": "Run status file could not be parsed.",
+            **initial_run_progress("unknown"),
         }
 
 
@@ -467,16 +470,87 @@ def upload_batch_run_log(batch_id, log_text, bucket=None):
     )
 
 
+def initial_run_progress(stage="queued"):
+    return {
+        "stage": stage,
+        "files_found": "",
+        "files_processed": 0,
+        "files_succeeded": 0,
+        "files_failed": 0,
+        "current_file": "",
+        "imported_records": "",
+        "last_message": "",
+    }
+
+
+def update_run_progress_from_line(progress, line):
+    message = line.strip()
+    if not message:
+        return False
+
+    previous_stage = progress.get("stage", "queued")
+    progress["last_message"] = message[-500:]
+
+    files_match = re.search(r"Found (\d+) file\(s\) to process", message)
+    if files_match:
+        progress["stage"] = "batch_processor"
+        progress["files_found"] = int(files_match.group(1))
+
+    if message == "== Batch processor ==":
+        progress["stage"] = "batch_processor"
+    elif message.startswith("Processing: "):
+        progress["stage"] = "extracting"
+        progress["current_file"] = message.removeprefix("Processing: ").strip()
+    elif message.startswith("Success: "):
+        progress["stage"] = "extracting"
+        progress["files_succeeded"] = int(progress.get("files_succeeded") or 0) + 1
+        progress["files_processed"] = (
+            int(progress.get("files_succeeded") or 0)
+            + int(progress.get("files_failed") or 0)
+        )
+        progress["current_file"] = ""
+    elif message.startswith("Failed: "):
+        progress["stage"] = "extracting"
+        progress["files_failed"] = int(progress.get("files_failed") or 0) + 1
+        progress["files_processed"] = (
+            int(progress.get("files_succeeded") or 0)
+            + int(progress.get("files_failed") or 0)
+        )
+        progress["current_file"] = ""
+    elif message.startswith("Done. Results written"):
+        progress["stage"] = "results_written"
+    elif message == "== Airtable importer ==":
+        progress["stage"] = "airtable_importer"
+    elif message.startswith("Importing: ") or message.startswith("Recording failure: "):
+        progress["stage"] = "airtable_importer"
+        progress["current_file"] = message
+    elif message.startswith("Done. Imported "):
+        progress["stage"] = "airtable_importer"
+        imported_match = re.search(r"Done\. Imported (\d+) records?", message)
+        if imported_match:
+            progress["imported_records"] = int(imported_match.group(1))
+    elif message.startswith("Updated batch summary"):
+        progress["stage"] = "airtable_summary"
+        progress["current_file"] = ""
+
+    return progress.get("stage") != previous_stage
+
+
 def run_batch_pipeline(batch_id):
     repo_dir = os.path.dirname(os.path.abspath(__file__))
     env = os.environ.copy()
     env["IMPORT_BATCH_ID"] = batch_id
     env["BATCH_INPUT_PREFIX"] = batch_input_prefix(batch_id)
     env["BATCH_RESULTS_PATH"] = batch_results_path(batch_id)
+    env["PYTHONUNBUFFERED"] = "1"
     started_at = datetime.now(UTC).isoformat()
+    progress = initial_run_progress("starting")
+    log_lines = []
 
-    try:
-        bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    def current_log_tail():
+        return "".join(log_lines)[-4000:]
+
+    def write_running_status(bucket, log_tail=None):
         write_batch_run_status(
             batch_id,
             {
@@ -485,29 +559,46 @@ def run_batch_pipeline(batch_id):
                 "finished_at": "",
                 "return_code": "",
                 "error": "",
-                "log_tail": "",
+                "log_tail": current_log_tail() if log_tail is None else log_tail,
+                **progress,
             },
             bucket,
         )
 
-        completed = subprocess.run(
-            [sys.executable, "run_import_pipeline.py"],
+    try:
+        bucket = get_bucket(DEFAULT_GCS_BUCKET)
+        write_running_status(bucket, "Batch run queued.\n")
+
+        process = subprocess.Popen(
+            [sys.executable, "-u", "run_import_pipeline.py"],
             cwd=repo_dir,
             env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            check=False,
+            bufsize=1,
         )
-        log_text = completed.stdout or ""
+
+        last_status_write = 0
+        for line in process.stdout or []:
+            log_lines.append(line)
+            stage_changed = update_run_progress_from_line(progress, line)
+            now = time.monotonic()
+            if stage_changed or now - last_status_write >= 2:
+                write_running_status(bucket)
+                last_status_write = now
+
+        return_code = process.wait()
+        log_text = "".join(log_lines)
         upload_batch_run_log(batch_id, log_text, bucket)
 
-        if completed.returncode == 0:
+        if return_code == 0:
             status = "succeeded"
             error = ""
+            progress["stage"] = "complete"
         else:
             status = "failed"
-            error = f"run_import_pipeline.py exited with {completed.returncode}"
+            error = f"run_import_pipeline.py exited with {return_code}"
 
         write_batch_run_status(
             batch_id,
@@ -515,9 +606,10 @@ def run_batch_pipeline(batch_id):
                 "status": status,
                 "started_at": started_at,
                 "finished_at": datetime.now(UTC).isoformat(),
-                "return_code": completed.returncode,
+                "return_code": return_code,
                 "error": error,
                 "log_tail": log_text[-4000:],
+                **progress,
             },
             bucket,
         )
@@ -533,6 +625,7 @@ def run_batch_pipeline(batch_id):
                     "return_code": "",
                     "error": error_text,
                     "log_tail": error_text,
+                    **progress,
                 },
             )
         except Exception:
@@ -647,6 +740,7 @@ async def run_batch(req: Request, batch_id: str, body: RunBatchRequest | None = 
             "return_code": "",
             "error": "",
             "log_tail": "Batch run queued.",
+            **initial_run_progress("queued"),
         },
         bucket,
     )
