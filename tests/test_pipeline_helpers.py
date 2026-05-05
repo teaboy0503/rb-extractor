@@ -365,6 +365,28 @@ class BatchVerificationTests(unittest.TestCase):
         waiting_check = next(check for check in checks if check["label"] == "Waiting files")
         self.assertIn("run the batch again", waiting_check["detail"])
 
+    def test_verification_reports_running_batch_as_in_progress(self):
+        checks = app.build_batch_verification_checks(
+            {"status": "running"},
+            {"exists": False, "total": 0, "success": 0, "failed": 0},
+            50,
+            0,
+            {
+                "item_side_linked_count": None,
+                "batch_side_linked_count": None,
+                "items_missing_collection": 0,
+                "items_missing_location": 0,
+                "warning": "No matching Airtable batch record found.",
+            },
+            {},
+        )
+
+        waiting_check = next(check for check in checks if check["label"] == "Waiting files")
+        airtable_check = next(check for check in checks if check["label"] == "Airtable Items")
+        self.assertIn("queued or processing", waiting_check["detail"])
+        self.assertNotIn("run the batch again", waiting_check["detail"])
+        self.assertIn("after the import step", airtable_check["detail"])
+
     def test_verification_ignores_already_successful_input_files(self):
         checks = app.build_batch_verification_checks(
             {"status": "succeeded"},

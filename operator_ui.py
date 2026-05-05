@@ -1438,6 +1438,8 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
 
       const counts = verification.counts || {};
+      const runStatus = verification.run_status?.status || "";
+      const runIsActive = runStatus === "running";
       nodes.verifyKnownFiles.textContent = String(counts.known_file_rows ?? 0);
       nodes.verifyAirtableItems.textContent = counts.airtable_item_records === null || counts.airtable_item_records === undefined
         ? "?"
@@ -1448,19 +1450,24 @@ OPERATOR_UI_HTML = """<!doctype html>
       const remaining = Number(counts.remaining_input_files || 0);
       if (remaining > 0) {
         nodes.verificationQueueNote.classList.remove("hidden");
-        nodes.verificationQueueNote.textContent =
-          `${remaining} file${remaining === 1 ? "" : "s"} still waiting. This usually means the run reached its per-run file limit. Run the batch again to continue.`;
+        if (runIsActive) {
+          nodes.verificationQueueNote.textContent =
+            `${remaining} file${remaining === 1 ? " is" : "s are"} still queued or processing. Refresh when the run completes.`;
+        } else {
+          nodes.verificationQueueNote.textContent =
+            `${remaining} file${remaining === 1 ? "" : "s"} still waiting. This usually means the run reached its per-run file limit. Run the batch again to continue.`;
+        }
       } else {
         nodes.verificationQueueNote.classList.add("hidden");
         nodes.verificationQueueNote.textContent = "";
       }
 
       const status = verification.overall_status || "warn";
-      const statusText = {
+      const statusText = runIsActive ? "Batch is running; verification will settle when the run completes." : ({
         ok: "Batch verification looks healthy.",
         warn: "Batch verification has warnings.",
         error: "Batch verification found problems."
-      }[status] || "Batch verification needs attention.";
+      }[status] || "Batch verification needs attention.");
       setStatus(nodes.verificationStatus, statusText, status === "error" ? "error" : status === "warn" ? "warn" : "ok");
 
       for (const check of verification.checks || []) {

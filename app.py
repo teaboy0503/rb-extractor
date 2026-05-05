@@ -49,7 +49,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.7-clear-operator-workflow"
+APP_VERSION = "1.13.8-running-verification"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -995,7 +995,15 @@ def build_batch_verification_checks(
     imported_count = airtable.get("item_side_linked_count")
     batch_side_count = airtable.get("batch_side_linked_count")
 
-    if run_state == "succeeded" and not results_exists:
+    if run_state == "running" and not results_exists:
+        checks.append(
+            verification_check(
+                "Results CSV",
+                "warn",
+                "Batch is running; the results CSV may not exist until files have been processed.",
+            )
+        )
+    elif run_state == "succeeded" and not results_exists:
         checks.append(verification_check("Results CSV", "error", "Run succeeded but no results CSV was found."))
     elif results_exists:
         checks.append(verification_check("Results CSV", "ok", f"{total_rows} result row(s) found."))
@@ -1008,7 +1016,16 @@ def build_batch_verification_checks(
         checks.append(verification_check("CSV statuses", "ok", "Every result row is success or failed."))
 
     if imported_count is None:
-        checks.append(verification_check("Airtable Items", "warn", "Could not verify Airtable linked items."))
+        if run_state == "running":
+            checks.append(
+                verification_check(
+                    "Airtable Items",
+                    "warn",
+                    "Batch is running; Airtable items are checked after the import step runs.",
+                )
+            )
+        else:
+            checks.append(verification_check("Airtable Items", "warn", "Could not verify Airtable linked items."))
     elif imported_count != success_rows:
         checks.append(
             verification_check(
@@ -1040,7 +1057,26 @@ def build_batch_verification_checks(
             )
         )
 
-    if run_state == "succeeded" and remaining_input_count:
+    if run_state == "running" and remaining_input_count:
+        checks.append(
+            verification_check(
+                "Waiting files",
+                "warn",
+                (
+                    f"{remaining_input_count} file(s) are still queued or processing. "
+                    "Refresh when the run completes."
+                ),
+            )
+        )
+    elif run_state == "running":
+        checks.append(
+            verification_check(
+                "Waiting files",
+                "warn",
+                "Batch is running; refresh when the run completes.",
+            )
+        )
+    elif run_state == "succeeded" and remaining_input_count:
         checks.append(
             verification_check(
                 "Waiting files",
@@ -1098,7 +1134,15 @@ def build_batch_verification_checks(
     elif manifest.get("location") and imported_count:
         checks.append(verification_check("Location links", "ok", "Imported items have location links."))
 
-    if airtable.get("warning"):
+    if airtable.get("warning") and run_state == "running" and "No matching Airtable batch record found" in airtable["warning"]:
+        checks.append(
+            verification_check(
+                "Airtable verification",
+                "warn",
+                "Airtable batch record may not exist until the import step runs.",
+            )
+        )
+    elif airtable.get("warning"):
         checks.append(verification_check("Airtable verification", "warn", airtable["warning"]))
 
     return checks
