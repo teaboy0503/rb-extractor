@@ -31,6 +31,7 @@ API_KEY = os.getenv("API_KEY", "")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", os.getenv("EXTRACTOR_TIMEOUT_SECONDS", "120")))
 
 MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
@@ -50,7 +51,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.16-stable-lookups"
+APP_VERSION = "1.14.0-direct-worker-extraction"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -625,6 +626,11 @@ def local_extractor_url():
 def should_use_local_batch_extractor():
     value = os.getenv("BATCH_USE_LOCAL_EXTRACTOR", "true").strip().lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def batch_extractor_mode():
+    mode = os.getenv("BATCH_EXTRACTOR_MODE", "direct").strip().lower()
+    return mode or "direct"
 
 
 def safe_filename(filename):
@@ -1813,9 +1819,12 @@ def run_batch_pipeline(batch_id, run_id):
     env["BATCH_INPUT_PREFIX"] = batch_input_prefix(batch_id)
     env["BATCH_RESULTS_PATH"] = batch_results_path(batch_id)
     env["PYTHONUNBUFFERED"] = "1"
-    local_url = os.getenv("BATCH_LOCAL_EXTRACTOR_URL", "").strip() or local_extractor_url()
-    if local_url and should_use_local_batch_extractor():
-        env["EXTRACTOR_URL"] = local_url
+    extractor_mode = batch_extractor_mode()
+    env["EXTRACTOR_MODE"] = extractor_mode
+    if extractor_mode == "http":
+        local_url = os.getenv("BATCH_LOCAL_EXTRACTOR_URL", "").strip() or local_extractor_url()
+        if local_url and should_use_local_batch_extractor():
+            env["EXTRACTOR_URL"] = local_url
     started_at = datetime.now(UTC).isoformat()
     progress = initial_run_progress("starting")
     log_lines = []
@@ -1951,17 +1960,17 @@ def run_batch_pipeline(batch_id, run_id):
 
 
 @app.get("/")
-def health():
+async def health():
     return {"status": "ok", "version": APP_VERSION}
 
 
 @app.get("/operator", response_class=HTMLResponse)
-def operator_ui():
+async def operator_ui():
     return OPERATOR_UI_HTML
 
 
 @app.post("/batches")
-async def create_batch(req: Request, body: CreateBatchRequest):
+def create_batch(req: Request, body: CreateBatchRequest):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(body.batch_id or make_batch_id())
@@ -1975,7 +1984,7 @@ async def create_batch(req: Request, body: CreateBatchRequest):
 
 
 @app.get("/batches")
-async def list_batches(req: Request, limit: int = 20):
+def list_batches(req: Request, limit: int = 20):
     require_bearer_auth(req)
 
     limit = max(1, min(limit, 100))
@@ -2028,7 +2037,7 @@ def create_airtable_option(req: Request, kind: str, body: CreateLookupOptionRequ
 
 
 @app.post("/batches/{batch_id}/upload-url")
-async def create_batch_upload_url(req: Request, batch_id: str, body: CreateUploadUrlRequest):
+def create_batch_upload_url(req: Request, batch_id: str, body: CreateUploadUrlRequest):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
@@ -2064,7 +2073,7 @@ async def create_batch_upload_url(req: Request, batch_id: str, body: CreateUploa
 
 
 @app.get("/batches/{batch_id}")
-async def get_batch_status(req: Request, batch_id: str):
+def get_batch_status(req: Request, batch_id: str):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
@@ -2072,7 +2081,7 @@ async def get_batch_status(req: Request, batch_id: str):
 
 
 @app.get("/batches/{batch_id}/failures")
-async def get_batch_failures(req: Request, batch_id: str):
+def get_batch_failures(req: Request, batch_id: str):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
@@ -2086,7 +2095,7 @@ async def get_batch_failures(req: Request, batch_id: str):
 
 
 @app.get("/batches/{batch_id}/verification")
-async def get_batch_verification(req: Request, batch_id: str):
+def get_batch_verification(req: Request, batch_id: str):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
@@ -2094,7 +2103,7 @@ async def get_batch_verification(req: Request, batch_id: str):
 
 
 @app.get("/batches/{batch_id}/log")
-async def get_batch_log(req: Request, batch_id: str):
+def get_batch_log(req: Request, batch_id: str):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
@@ -2108,7 +2117,7 @@ async def get_batch_log(req: Request, batch_id: str):
 
 
 @app.post("/batches/{batch_id}/retry-failures")
-async def retry_failures(req: Request, batch_id: str, body: RetryFailuresRequest | None = None):
+def retry_failures(req: Request, batch_id: str, body: RetryFailuresRequest | None = None):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
@@ -2133,7 +2142,7 @@ async def retry_failures(req: Request, batch_id: str, body: RetryFailuresRequest
 
 
 @app.post("/batches/{batch_id}/stop")
-async def stop_batch(req: Request, batch_id: str):
+def stop_batch(req: Request, batch_id: str):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
@@ -2188,7 +2197,7 @@ async def stop_batch(req: Request, batch_id: str):
 
 
 @app.post("/batches/{batch_id}/run")
-async def run_batch(req: Request, batch_id: str, body: RunBatchRequest | None = None):
+def run_batch(req: Request, batch_id: str, body: RunBatchRequest | None = None):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
@@ -2240,11 +2249,8 @@ async def run_batch(req: Request, batch_id: str, body: RunBatchRequest | None = 
     return batch_status_payload(batch_id, bucket)
 
 
-@app.post("/extract")
-def extract(req: Request, body: ExtractRequest):
-    require_bearer_auth(req)
-
-    image_bytes = download_gcs_bytes(body.gcs_bucket, body.gcs_object_path)
+def extract_from_gcs(gcs_bucket, gcs_object_path):
+    image_bytes = download_gcs_bytes(gcs_bucket, gcs_object_path)
     image_bytes, orientation_action = fix_image_orientation(image_bytes)
     downloaded_image_bytes = len(image_bytes)
 
@@ -2252,7 +2258,7 @@ def extract(req: Request, body: ExtractRequest):
 
     del image_bytes
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS)
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -2270,7 +2276,7 @@ def extract(req: Request, body: ExtractRequest):
     return {
         "app_version": APP_VERSION,
         "image_source": "Google Cloud Storage",
-        "image_ref": body.gcs_object_path,
+        "image_ref": gcs_object_path,
         "ocr_text": ocr_text,
         "ocr_confidence": ocr_conf,
         "ocr_length": len(ocr_text),
@@ -2292,3 +2298,10 @@ def extract(req: Request, body: ExtractRequest):
             "orientation_action": orientation_action,
         },
     }
+
+
+@app.post("/extract")
+def extract(req: Request, body: ExtractRequest):
+    require_bearer_auth(req)
+
+    return extract_from_gcs(body.gcs_bucket, body.gcs_object_path)

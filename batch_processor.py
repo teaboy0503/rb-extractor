@@ -6,6 +6,7 @@ import time
 from datetime import datetime, UTC
 
 import requests
+from fastapi import HTTPException
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -20,6 +21,7 @@ RESULTS_PATH = os.getenv("BATCH_RESULTS_PATH", "results/batch_results.csv")
 IMPORT_BATCH_ID = os.getenv("IMPORT_BATCH_ID") or datetime.now(UTC).strftime("batch-%Y%m%dT%H%M%SZ")
 
 EXTRACTOR_URL = os.getenv("EXTRACTOR_URL", "https://rb-extractor.onrender.com/extract")
+EXTRACTOR_MODE = os.getenv("EXTRACTOR_MODE", "direct").strip().lower() or "direct"
 EXTRACTOR_API_KEY = os.getenv("API_KEY", "")
 
 MAX_FILES = int(os.getenv("MAX_FILES", "3"))
@@ -83,6 +85,9 @@ def list_input_blobs():
 
 
 def call_extractor(blob_name):
+    if EXTRACTOR_MODE == "direct":
+        return call_extractor_direct(blob_name)
+
     payload = {
         "gcs_bucket": BUCKET_NAME,
         "gcs_object_path": blob_name,
@@ -102,6 +107,16 @@ def call_extractor(blob_name):
         raise ExtractorError(response.status_code, response.text)
 
     return response.json()
+
+
+def call_extractor_direct(blob_name):
+    try:
+        from app import extract_from_gcs
+
+        return extract_from_gcs(BUCKET_NAME, blob_name)
+    except HTTPException as error:
+        detail = error.detail if isinstance(error.detail, str) else json.dumps(error.detail)
+        raise ExtractorError(error.status_code, detail) from error
 
 
 def should_retry_extractor_error(error):
@@ -296,7 +311,9 @@ def main():
     print(f"Input prefix: {INPUT_PREFIX}")
     print(f"Import batch ID: {IMPORT_BATCH_ID}")
     print(f"Results path: {RESULTS_PATH}")
-    print(f"Extractor URL: {EXTRACTOR_URL}")
+    print(f"Extractor mode: {EXTRACTOR_MODE}")
+    if EXTRACTOR_MODE != "direct":
+        print(f"Extractor URL: {EXTRACTOR_URL}")
     print(f"Max files: {MAX_FILES}")
     print(f"Sleep seconds: {SLEEP_SECONDS}")
     print(f"Max extractor attempts: {MAX_EXTRACTOR_ATTEMPTS}")

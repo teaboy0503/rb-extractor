@@ -948,13 +948,32 @@ OPERATOR_UI_HTML = """<!doctype html>
     }
 
     async function apiFetch(path, options = {}) {
-      const response = await fetch(`${state.apiBase}${path}`, {
-        ...options,
-        headers: {
-          ...headers(),
-          ...(options.headers || {})
+      const { timeoutMs = 30000, headers: optionHeaders = {}, ...fetchOptions } = options;
+      const controller = timeoutMs ? new AbortController() : null;
+      const timeoutId = controller
+        ? window.setTimeout(() => controller.abort(), timeoutMs)
+        : null;
+      let response;
+
+      try {
+        response = await fetch(`${state.apiBase}${path}`, {
+          ...fetchOptions,
+          signal: fetchOptions.signal || controller?.signal,
+          headers: {
+            ...headers(),
+            ...optionHeaders
+          }
+        });
+      } catch (error) {
+        if (error.name === "AbortError") {
+          throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
         }
-      });
+        throw error;
+      } finally {
+        if (timeoutId) {
+          window.clearTimeout(timeoutId);
+        }
+      }
 
       const text = await response.text();
       let data = {};
@@ -2101,11 +2120,31 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     async function copyText(text) {
       if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-        return true;
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch {
+          // Fall through to the textarea copy path.
+        }
       }
 
-      return false;
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      textarea.style.top = "0";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+
+      try {
+        return document.execCommand("copy");
+      } catch {
+        return false;
+      } finally {
+        document.body.removeChild(textarea);
+      }
     }
 
     function showErrorReport(report) {
@@ -2117,17 +2156,8 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     async function copyOrShowErrorReport(report) {
       showErrorReport(report);
-
       try {
-        if (await copyText(report)) {
-          return true;
-        }
-      } catch {
-        // Keep the selected report visible as a manual fallback.
-      }
-
-      try {
-        return document.execCommand("copy");
+        return await copyText(report);
       } catch {
         return false;
       }
@@ -2166,13 +2196,14 @@ OPERATOR_UI_HTML = """<!doctype html>
       if (!state.batch?.batch_id) return;
       saveAccess();
       nodes.copyErrorReportBtn.disabled = true;
+      let report = errorReportFromData({});
+      showErrorReport(report);
 
       try {
-        if (!state.verification) {
-          await loadVerification(true);
-        }
-        const logData = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/log`);
-        const report = errorReportFromData(logData);
+        const logData = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/log`, {
+          timeoutMs: 8000
+        });
+        report = errorReportFromData(logData);
         const copied = await copyOrShowErrorReport(report);
         setStatus(
           nodes.runStatus,
@@ -2180,8 +2211,8 @@ OPERATOR_UI_HTML = """<!doctype html>
           copied ? "ok" : "warn"
         );
       } catch (error) {
-        const report = errorReportFromData({});
-        showErrorReport(`${report}\\n\\nReport copy error: ${error.message}`);
+        report = `${report}\\n\\nReport copy warning: ${error.message}`;
+        await copyOrShowErrorReport(report);
         setStatus(nodes.runStatus, "Error report shown below with the copy error.", "warn");
       } finally {
         nodes.copyErrorReportBtn.disabled = !state.batch?.batch_id;
