@@ -50,7 +50,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.15-local-batch-extractor"
+APP_VERSION = "1.13.16-stable-lookups"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -324,6 +324,30 @@ def list_airtable_lookup_options(kind, limit=1000):
         "fields_used": sorted(used_fields),
         "warnings": warnings,
     }
+
+
+def safe_list_airtable_lookup_options(kind, limit=1000):
+    try:
+        return list_airtable_lookup_options(kind, limit=limit)
+    except HTTPException as error:
+        config = airtable_lookup_config(kind)
+        detail = error.detail if isinstance(error.detail, str) else json.dumps(error.detail)
+        return {
+            "options": [],
+            "records_seen": 0,
+            "field": config["field"],
+            "fields_used": [],
+            "warnings": [f"Could not load Airtable {kind}: {detail}"],
+        }
+    except Exception as error:
+        config = airtable_lookup_config(kind)
+        return {
+            "options": [],
+            "records_seen": 0,
+            "field": config["field"],
+            "fields_used": [],
+            "warnings": [f"Could not load Airtable {kind}: {error}"],
+        }
 
 
 def get_or_create_airtable_lookup_option(kind, name):
@@ -1969,8 +1993,8 @@ async def list_batches(req: Request, limit: int = 20):
 @app.get("/airtable-options")
 def get_airtable_options(req: Request):
     require_bearer_auth(req)
-    collections = list_airtable_lookup_options("collections")
-    locations = list_airtable_lookup_options("locations")
+    collections = safe_list_airtable_lookup_options("collections")
+    locations = safe_list_airtable_lookup_options("locations")
     legacy_collections = list_airtable_select_field_options(AIRTABLE_TABLE_NAME, AIRTABLE_LEGACY_COLLECTION_FIELD)
     legacy_added = merge_airtable_lookup_options(
         collections,

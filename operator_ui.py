@@ -847,6 +847,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       batch: null,
       batches: [],
       lookupOptions: { collections: [], locations: [] },
+      lookupValues: { collections: "", locations: "" },
       verification: null,
       failures: [],
       failuresBatchId: "",
@@ -1003,6 +1004,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       setStatus(nodes.accessStatus, "Cleared.", "warn");
       state.batches = [];
       state.lookupOptions = { collections: [], locations: [] };
+      state.lookupValues = { collections: "", locations: "" };
       renderLookupOptions();
       renderBatchList();
       setStatus(nodes.batchStatus, "Save API access to load collections and locations.", "warn");
@@ -1050,7 +1052,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     function renderLookupSelect(kind) {
       const { select, emptyLabel } = lookupNodes(kind);
-      const currentValue = select.value;
+      const currentValue = state.lookupValues[kind] || select.value;
       const options = state.lookupOptions[kind] || [];
 
       select.innerHTML = "";
@@ -1096,6 +1098,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       const options = state.lookupOptions[kind] || [];
       value = (value || "").trim();
 
+      state.lookupValues[kind] = value;
       input.value = "";
       if (value && !options.some((option) => option.name === value) && !selectHasValue(select, value)) {
         appendLookupOption(select, value, value);
@@ -1105,7 +1108,9 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     function selectedLookupValue(kind) {
       const { select, input } = lookupNodes(kind);
-      return (input.value.trim() || select.value.trim());
+      const value = input.value.trim() || select.value.trim();
+      state.lookupValues[kind] = value;
+      return value;
     }
 
     async function loadLookupOptions(quiet = false) {
@@ -2200,6 +2205,12 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.createBatchBtn.addEventListener("click", createBatch);
       nodes.addCollectionBtn.addEventListener("click", () => addLookupOption("collections"));
       nodes.addLocationBtn.addEventListener("click", () => addLookupOption("locations"));
+      nodes.collectionSelect.addEventListener("change", () => {
+        state.lookupValues.collections = nodes.collectionSelect.value.trim();
+      });
+      nodes.locationSelect.addEventListener("change", () => {
+        state.lookupValues.locations = nodes.locationSelect.value.trim();
+      });
       nodes.refreshBatchBtn.addEventListener("click", refreshBatch);
       nodes.loadBatchBtn.addEventListener("click", () => loadBatch(nodes.existingBatchInput.value));
       nodes.listBatchesBtn.addEventListener("click", () => listBatches());
@@ -2246,12 +2257,16 @@ OPERATOR_UI_HTML = """<!doctype html>
         addFiles(event.dataTransfer.files);
       });
 
-      if (state.token && state.batchId) {
-        loadBatch(state.batchId, true);
-      }
       if (state.token) {
-        loadLookupOptions(true);
-        listBatches(true);
+        hydrateSession();
+      }
+    }
+
+    async function hydrateSession() {
+      await loadLookupOptions(true);
+      await listBatches(true);
+      if (state.batchId) {
+        await loadBatch(state.batchId, true);
       }
     }
 
