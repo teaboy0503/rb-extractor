@@ -245,6 +245,63 @@ class BatchMetadataTests(unittest.TestCase):
         )
 
 
+class BatchVerificationTests(unittest.TestCase):
+    def test_verification_checks_are_ok_when_counts_match(self):
+        checks = app.build_batch_verification_checks(
+            {"status": "succeeded"},
+            {"exists": True, "total": 2, "success": 2, "failed": 0},
+            0,
+            0,
+            {
+                "item_side_linked_count": 2,
+                "batch_side_linked_count": 2,
+                "items_missing_collection": 0,
+                "items_missing_location": 0,
+                "warning": "",
+            },
+            {"target_collection": "Rare Books", "location": "Shelf A"},
+        )
+
+        self.assertEqual(app.verification_overall_status(checks), "ok")
+
+    def test_verification_flags_airtable_import_mismatch(self):
+        checks = app.build_batch_verification_checks(
+            {"status": "succeeded"},
+            {"exists": True, "total": 2, "success": 2, "failed": 0},
+            0,
+            0,
+            {
+                "item_side_linked_count": 1,
+                "batch_side_linked_count": 1,
+                "items_missing_collection": 0,
+                "items_missing_location": 0,
+                "warning": "",
+            },
+            {},
+        )
+
+        self.assertEqual(app.verification_overall_status(checks), "error")
+        self.assertTrue(any(check["label"] == "Airtable Items" for check in checks))
+
+    def test_verification_flags_remaining_input_files(self):
+        checks = app.build_batch_verification_checks(
+            {"status": "succeeded"},
+            {"exists": True, "total": 1, "success": 1, "failed": 0},
+            1,
+            0,
+            {
+                "item_side_linked_count": 1,
+                "batch_side_linked_count": 1,
+                "items_missing_collection": 0,
+                "items_missing_location": 0,
+                "warning": "",
+            },
+            {},
+        )
+
+        self.assertEqual(app.verification_overall_status(checks), "warn")
+
+
 class FailureRetryTests(unittest.TestCase):
     def setUp(self):
         self.original_download_rows = app.download_batch_results_rows

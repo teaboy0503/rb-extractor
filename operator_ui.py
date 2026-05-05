@@ -361,6 +361,58 @@ OPERATOR_UI_HTML = """<!doctype html>
       overflow-wrap: anywhere;
     }
 
+    .verification-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .verification-row {
+      display: grid;
+      grid-template-columns: 88px minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #ffffff;
+    }
+
+    .verification-badge {
+      border-radius: 999px;
+      padding: 3px 8px;
+      text-align: center;
+      font-size: 12px;
+      font-weight: 720;
+      background: var(--surface-2);
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    .verification-row.ok .verification-badge {
+      background: #dcfce7;
+      color: var(--ok);
+    }
+
+    .verification-row.warn .verification-badge {
+      background: #fef3c7;
+      color: var(--warn);
+    }
+
+    .verification-row.error .verification-badge {
+      background: #fee2e2;
+      color: var(--danger);
+    }
+
+    .verification-title {
+      font-weight: 720;
+    }
+
+    .verification-detail {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
     .failure-detail {
       color: var(--muted);
       font-size: 12px;
@@ -718,6 +770,33 @@ OPERATOR_UI_HTML = """<!doctype html>
 
         <div class="panel">
           <div class="panel-head">
+            <h2>Batch Verification</h2>
+            <button id="refreshVerificationBtn" type="button" disabled>Refresh</button>
+          </div>
+          <div class="metrics">
+            <div class="metric">
+              <span class="metric-value" id="verifyKnownFiles">0</span>
+              <span class="metric-label">Known files</span>
+            </div>
+            <div class="metric">
+              <span class="metric-value" id="verifyAirtableItems">0</span>
+              <span class="metric-label">Airtable items</span>
+            </div>
+            <div class="metric">
+              <span class="metric-value" id="verifyRemaining">0</span>
+              <span class="metric-label">Waiting</span>
+            </div>
+            <div class="metric">
+              <span class="metric-value" id="verifyFailures">0</span>
+              <span class="metric-label">Unresolved</span>
+            </div>
+          </div>
+          <div id="verificationStatus" class="status-line" style="margin-top:12px;"></div>
+          <div id="verificationList" class="verification-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
             <h2>Failures</h2>
             <div class="row">
               <button id="refreshFailuresBtn" type="button" disabled>Refresh</button>
@@ -739,8 +818,10 @@ OPERATOR_UI_HTML = """<!doctype html>
       batch: null,
       batches: [],
       lookupOptions: { collections: [], locations: [] },
+      verification: null,
       failures: [],
       runPollTimer: null,
+      uploadInProgress: false,
       files: [],
       uploads: new Map()
     };
@@ -793,11 +874,30 @@ OPERATOR_UI_HTML = """<!doctype html>
       runCommand: el("runCommand"),
       runLog: el("runLog"),
       copyCommandBtn: el("copyCommandBtn"),
+      refreshVerificationBtn: el("refreshVerificationBtn"),
+      verificationStatus: el("verificationStatus"),
+      verificationList: el("verificationList"),
+      verifyKnownFiles: el("verifyKnownFiles"),
+      verifyAirtableItems: el("verifyAirtableItems"),
+      verifyRemaining: el("verifyRemaining"),
+      verifyFailures: el("verifyFailures"),
       refreshFailuresBtn: el("refreshFailuresBtn"),
       retryFailuresBtn: el("retryFailuresBtn"),
       failureStatus: el("failureStatus"),
       failureList: el("failureList")
     };
+
+    const UPLOAD_CONCURRENCY = 4;
+    let fileRenderScheduled = false;
+
+    function scheduleRenderFiles() {
+      if (fileRenderScheduled) return;
+      fileRenderScheduled = true;
+      window.requestAnimationFrame(() => {
+        fileRenderScheduled = false;
+        renderFiles();
+      });
+    }
 
     function setStatus(node, message, type = "") {
       node.textContent = message || "";
@@ -1012,9 +1112,12 @@ OPERATOR_UI_HTML = """<!doctype html>
         nodes.runBatchBtn.textContent = "Run Batch";
         nodes.runBatchBtn.title = "";
         nodes.copyCommandBtn.disabled = true;
+        nodes.refreshVerificationBtn.disabled = true;
         nodes.refreshFailuresBtn.disabled = true;
+        state.verification = null;
         state.failures = [];
         renderRunStatus(null);
+        renderVerification();
         renderFailures();
         return;
       }
@@ -1041,10 +1144,12 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.runBatchBtn.textContent = runButtonLabel(data);
       nodes.runBatchBtn.title = runButtonTitle(data);
       nodes.copyCommandBtn.disabled = !data.run_command;
+      nodes.refreshVerificationBtn.disabled = false;
       nodes.refreshFailuresBtn.disabled = false;
       renderRunStatus(data.run);
       updateUploadButtons();
       renderBatchList();
+      renderVerification();
       renderFailures();
     }
 
@@ -1275,6 +1380,82 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
     }
 
+    function renderVerification() {
+      const verification = state.verification;
+      nodes.verificationList.innerHTML = "";
+      nodes.refreshVerificationBtn.disabled = !state.batch?.batch_id;
+
+      if (!verification) {
+        nodes.verifyKnownFiles.textContent = "0";
+        nodes.verifyAirtableItems.textContent = "0";
+        nodes.verifyRemaining.textContent = "0";
+        nodes.verifyFailures.textContent = "0";
+        setStatus(nodes.verificationStatus, state.batch?.batch_id ? "Run verification after processing." : "Load a batch to verify it.");
+        return;
+      }
+
+      const counts = verification.counts || {};
+      nodes.verifyKnownFiles.textContent = String(counts.known_file_rows ?? 0);
+      nodes.verifyAirtableItems.textContent = counts.airtable_item_records === null || counts.airtable_item_records === undefined
+        ? "?"
+        : String(counts.airtable_item_records);
+      nodes.verifyRemaining.textContent = String(counts.remaining_input_files ?? 0);
+      nodes.verifyFailures.textContent = String(counts.unresolved_failure_rows ?? 0);
+
+      const status = verification.overall_status || "warn";
+      const statusText = {
+        ok: "Batch verification looks healthy.",
+        warn: "Batch verification has warnings.",
+        error: "Batch verification found problems."
+      }[status] || "Batch verification needs attention.";
+      setStatus(nodes.verificationStatus, statusText, status === "error" ? "error" : status === "warn" ? "warn" : "ok");
+
+      for (const check of verification.checks || []) {
+        const row = document.createElement("div");
+        row.className = `verification-row ${check.status || ""}`.trim();
+
+        const badge = document.createElement("div");
+        badge.className = "verification-badge";
+        badge.textContent = check.status || "info";
+
+        const content = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "verification-title";
+        title.textContent = check.label || "Check";
+        const detail = document.createElement("div");
+        detail.className = "verification-detail";
+        detail.textContent = check.detail || "";
+        content.append(title, detail);
+
+        row.append(badge, content);
+        nodes.verificationList.appendChild(row);
+      }
+    }
+
+    async function loadVerification(quiet = false) {
+      if (!state.batch?.batch_id) {
+        state.verification = null;
+        renderVerification();
+        return;
+      }
+
+      if (!quiet) {
+        setStatus(nodes.verificationStatus, "Checking batch...");
+      }
+      nodes.refreshVerificationBtn.disabled = true;
+
+      try {
+        state.verification = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/verification`);
+        renderVerification();
+      } catch (error) {
+        if (!quiet) {
+          setStatus(nodes.verificationStatus, error.message, "error");
+        }
+      } finally {
+        nodes.refreshVerificationBtn.disabled = !state.batch?.batch_id;
+      }
+    }
+
     function renderFailures() {
       nodes.failureList.innerHTML = "";
       const isRunning = state.batch?.run?.status === "running";
@@ -1365,6 +1546,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         state.failures = data.failures || [];
         updateBatchView(state.batch);
         renderFailures();
+        await loadVerification(true);
         await listBatches(true);
         const queued = data.summary?.queued || 0;
         const alreadyQueued = data.summary?.already_queued || 0;
@@ -1416,6 +1598,9 @@ OPERATOR_UI_HTML = """<!doctype html>
         const data = await apiFetch(`/batches/${encodeURIComponent(trimmedBatchId)}`);
         updateBatchView(data);
         await loadFailures(true);
+        if (data.run?.status !== "running") {
+          await loadVerification(true);
+        }
         if (!quiet) {
           setStatus(nodes.batchStatus, `Loaded ${trimmedBatchId}.`, "ok");
         }
@@ -1448,7 +1633,9 @@ OPERATOR_UI_HTML = """<!doctype html>
           uploaded_count: 0,
           results: { exists: false, total: 0, success: 0, failed: 0 }
         });
+        state.verification = null;
         state.failures = [];
+        renderVerification();
         renderFailures();
         await listBatches(true);
         setStatus(nodes.batchStatus, `Created ${data.batch_id}.`, "ok");
@@ -1477,6 +1664,9 @@ OPERATOR_UI_HTML = """<!doctype html>
         });
         updateBatchView(data);
         await loadFailures(true);
+        if (data.run?.status !== "running") {
+          await loadVerification(true);
+        }
         await listBatches(true);
       } catch (error) {
         setStatus(nodes.runStatus, error.message, "error");
@@ -1558,8 +1748,9 @@ OPERATOR_UI_HTML = """<!doctype html>
     function updateUploadButtons() {
       const hasBatch = Boolean(state.batch?.batch_id);
       const hasFiles = state.files.length > 0;
-      nodes.uploadBtn.disabled = !hasBatch || !hasFiles;
-      nodes.clearFilesBtn.disabled = !hasFiles;
+      nodes.uploadBtn.disabled = !hasBatch || !hasFiles || state.uploadInProgress;
+      nodes.clearFilesBtn.disabled = !hasFiles || state.uploadInProgress;
+      nodes.uploadBtn.textContent = state.uploadInProgress ? "Uploading..." : "Upload Selected";
     }
 
     function uploadWithProgress(url, file, contentType, onProgress) {
@@ -1589,7 +1780,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       const key = fileKey(file);
       const contentType = file.type || "application/octet-stream";
       state.uploads.set(key, { status: "signing", progress: 0, message: "" });
-      renderFiles();
+      scheduleRenderFiles();
 
       const signed = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/upload-url`, {
         method: "POST",
@@ -1601,52 +1792,92 @@ OPERATOR_UI_HTML = """<!doctype html>
       });
 
       state.uploads.set(key, { status: "uploading", progress: 1, message: signed.object_path });
-      renderFiles();
+      scheduleRenderFiles();
 
       await uploadWithProgress(signed.upload_url, file, contentType, (progress) => {
         state.uploads.set(key, { status: "uploading", progress, message: signed.object_path });
-        renderFiles();
+        scheduleRenderFiles();
       });
 
       state.uploads.set(key, { status: "done", progress: 100, message: signed.object_path });
-      renderFiles();
+      scheduleRenderFiles();
     }
 
     async function uploadSelected() {
       if (!state.batch?.batch_id || !state.files.length) return;
       saveAccess();
-      nodes.uploadBtn.disabled = true;
-      setStatus(nodes.uploadStatus, "Uploading...");
+      state.uploadInProgress = true;
+      updateUploadButtons();
 
-      let success = 0;
+      const pending = state.files.filter((file) => {
+        const current = state.uploads.get(fileKey(file));
+        return current?.status !== "done";
+      });
+      const alreadyUploaded = state.files.length - pending.length;
+      const total = pending.length;
+      let index = 0;
+      let completed = 0;
+      let success = alreadyUploaded;
       let failed = 0;
 
-      for (const file of state.files) {
-        const key = fileKey(file);
-        const current = state.uploads.get(key);
-        if (current?.status === "done") {
-          success += 1;
-          continue;
-        }
+      if (!pending.length) {
+        state.uploadInProgress = false;
+        setStatus(nodes.uploadStatus, "All selected files are already uploaded.", "ok");
+        updateUploadButtons();
+        return;
+      }
 
-        try {
-          await uploadOne(file);
-          success += 1;
-        } catch (error) {
-          failed += 1;
-          state.uploads.set(key, { status: "error", progress: 0, message: error.message });
-          renderFiles();
+      const parallelUploads = Math.min(UPLOAD_CONCURRENCY, pending.length);
+      const setProgressStatus = () => {
+        setStatus(
+          nodes.uploadStatus,
+          `Uploading ${completed}/${total} file${total === 1 ? "" : "s"} (${parallelUploads} at a time)...`
+        );
+      };
+      setProgressStatus();
+
+      async function uploadWorker() {
+        while (index < pending.length) {
+          const file = pending[index];
+          index += 1;
+          const key = fileKey(file);
+
+          try {
+            await uploadOne(file);
+            success += 1;
+          } catch (error) {
+            failed += 1;
+            state.uploads.set(key, { status: "error", progress: 0, message: error.message });
+            scheduleRenderFiles();
+          } finally {
+            completed += 1;
+            setProgressStatus();
+          }
         }
       }
 
+      try {
+        const workers = Array.from(
+          { length: parallelUploads },
+          uploadWorker,
+        );
+        await Promise.all(workers);
+      } finally {
+        state.uploadInProgress = false;
+      }
+
+      renderFiles();
       setStatus(
         nodes.uploadStatus,
         `Uploaded ${success} file${success === 1 ? "" : "s"}${failed ? `, ${failed} failed` : ""}.`,
         failed ? "warn" : "ok"
       );
-      await refreshBatch();
-      await listBatches(true);
-      updateUploadButtons();
+      try {
+        await refreshBatch();
+        await listBatches(true);
+      } finally {
+        updateUploadButtons();
+      }
     }
 
     async function copyCommand() {
@@ -1667,6 +1898,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.existingBatchInput.value = state.batchId;
       updateBatchView(null);
       renderBatchList();
+      renderVerification();
       renderFailures();
       renderFiles();
 
@@ -1680,6 +1912,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.loadBatchBtn.addEventListener("click", () => loadBatch(nodes.existingBatchInput.value));
       nodes.listBatchesBtn.addEventListener("click", () => listBatches());
       nodes.runBatchBtn.addEventListener("click", runBatch);
+      nodes.refreshVerificationBtn.addEventListener("click", () => loadVerification());
       nodes.refreshFailuresBtn.addEventListener("click", () => loadFailures());
       nodes.retryFailuresBtn.addEventListener("click", retryFailures);
       nodes.chooseFilesBtn.addEventListener("click", () => nodes.fileInput.click());
@@ -1692,6 +1925,12 @@ OPERATOR_UI_HTML = """<!doctype html>
         updateUploadButtons();
       });
       nodes.copyCommandBtn.addEventListener("click", copyCommand);
+
+      window.addEventListener("beforeunload", (event) => {
+        if (!state.uploadInProgress) return;
+        event.preventDefault();
+        event.returnValue = "";
+      });
 
       ["dragenter", "dragover"].forEach((eventName) => {
         nodes.dropzone.addEventListener(eventName, (event) => {

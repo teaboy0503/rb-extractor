@@ -38,11 +38,17 @@ SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUT
 BATCH_RUN_LOCK_TTL_SECONDS = int(os.getenv("BATCH_RUN_LOCK_TTL_SECONDS", "21600"))
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Items")
+AIRTABLE_BATCH_TABLE_NAME = os.getenv("AIRTABLE_BATCH_TABLE_NAME", "Batches")
+AIRTABLE_BATCH_NAME_FIELD = os.getenv("AIRTABLE_BATCH_NAME_FIELD", "Batch name")
+AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Related Batch")
 AIRTABLE_COLLECTIONS_TABLE_NAME = os.getenv("AIRTABLE_COLLECTIONS_TABLE_NAME", "Collections")
 AIRTABLE_COLLECTION_NAME_FIELD = os.getenv("AIRTABLE_COLLECTION_NAME_FIELD", "Collection name")
+AIRTABLE_ITEM_COLLECTION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_COLLECTION_LINK_FIELD", "Collection (linked)")
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
-APP_VERSION = "1.12.0-operator-failures"
+AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
+APP_VERSION = "1.13.0-batch-verification"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -225,6 +231,102 @@ def get_or_create_airtable_lookup_option(kind, name):
         "name": record.get("fields", {}).get(config["field"], name),
         "created": True,
     }
+
+
+def list_airtable_records(table_name, params=None, limit=1000):
+    require_airtable_config()
+    records = []
+    offset = None
+
+    while len(records) < limit:
+        page_params = dict(params or {})
+        page_params["pageSize"] = min(100, limit - len(records))
+        if offset:
+            page_params["offset"] = offset
+
+        response = requests.get(
+            airtable_url(table_name),
+            headers=airtable_headers(),
+            params=page_params,
+            timeout=60,
+        )
+
+        if not response.ok:
+            raise RuntimeError(f"Airtable read failed: {response.status_code}: {response.text}")
+
+        data = response.json()
+        records.extend(data.get("records", []))
+        offset = data.get("offset")
+        if not offset:
+            break
+
+    return records
+
+
+def get_airtable_batch_record(batch_id):
+    records = list_airtable_records(
+        AIRTABLE_BATCH_TABLE_NAME,
+        params={
+            "filterByFormula": f"{{{AIRTABLE_BATCH_NAME_FIELD}}} = {airtable_formula_string(batch_id)}",
+            "maxRecords": 1,
+        },
+        limit=1,
+    )
+    return records[0] if records else None
+
+
+def airtable_item_records_for_batch(batch_record):
+    if not batch_record:
+        return []
+
+    batch_name = (batch_record.get("fields", {}).get(AIRTABLE_BATCH_NAME_FIELD) or "").strip()
+    if not batch_name:
+        return []
+
+    formula = (
+        f"FIND({airtable_formula_string(batch_name)}, "
+        f"ARRAYJOIN({{{AIRTABLE_ITEM_BATCH_LINK_FIELD}}})) > 0"
+    )
+
+    records = list_airtable_records(
+        AIRTABLE_TABLE_NAME,
+        params={
+            "filterByFormula": formula,
+            "sort[0][field]": "Created Date",
+            "sort[0][direction]": "desc",
+        },
+        limit=5000,
+    )
+
+    batch_record_id = batch_record.get("id")
+    return [
+        record for record in records
+        if batch_record_id in record.get("fields", {}).get(AIRTABLE_ITEM_BATCH_LINK_FIELD, [])
+    ]
+
+
+def batch_side_linked_item_summary(batch_record):
+    if not batch_record:
+        return {"field": "", "count": None}
+
+    candidates = []
+    for field_name, value in batch_record.get("fields", {}).items():
+        if not field_name.lower().startswith("items"):
+            continue
+        if isinstance(value, list):
+            candidates.append((field_name, len(value)))
+
+    if not candidates:
+        return {"field": "", "count": None}
+
+    field_name, count = max(candidates, key=lambda item: item[1])
+    return {"field": field_name, "count": count}
+
+
+def count_items_missing_field(records, field_name):
+    if not field_name:
+        return 0
+    return sum(1 for record in records if not record.get("fields", {}).get(field_name))
 
 
 def get_google_credentials():
@@ -630,6 +732,212 @@ def batch_failure_rows(batch_id, bucket=None):
 
     failures.sort(key=lambda item: item.get("processed_at") or "")
     return failures
+
+
+def verification_check(label, status, detail):
+    return {
+        "label": label,
+        "status": status,
+        "detail": detail,
+    }
+
+
+def verification_overall_status(checks):
+    statuses = {check["status"] for check in checks}
+    if "error" in statuses:
+        return "error"
+    if "warn" in statuses:
+        return "warn"
+    return "ok"
+
+
+def build_batch_verification_checks(
+    run_status,
+    results,
+    remaining_input_count,
+    unresolved_failure_count,
+    airtable,
+    manifest,
+):
+    checks = []
+    run_state = (run_status or {}).get("status", "not_started")
+    results_exists = bool(results.get("exists"))
+    success_rows = int(results.get("success") or 0)
+    failed_rows = int(results.get("failed") or 0)
+    total_rows = int(results.get("total") or 0)
+    imported_count = airtable.get("item_side_linked_count")
+    batch_side_count = airtable.get("batch_side_linked_count")
+
+    if run_state == "succeeded" and not results_exists:
+        checks.append(verification_check("Results CSV", "error", "Run succeeded but no results CSV was found."))
+    elif results_exists:
+        checks.append(verification_check("Results CSV", "ok", f"{total_rows} result row(s) found."))
+    else:
+        checks.append(verification_check("Results CSV", "warn", "No results CSV yet."))
+
+    if total_rows != success_rows + failed_rows:
+        checks.append(verification_check("CSV statuses", "warn", "Some result rows have an unknown status."))
+    elif total_rows:
+        checks.append(verification_check("CSV statuses", "ok", "Every result row is success or failed."))
+
+    if imported_count is None:
+        checks.append(verification_check("Airtable Items", "warn", "Could not verify Airtable linked items."))
+    elif imported_count != success_rows:
+        checks.append(
+            verification_check(
+                "Airtable Items",
+                "error",
+                f"{success_rows} successful CSV row(s), but {imported_count} linked Airtable item(s).",
+            )
+        )
+    else:
+        checks.append(verification_check("Airtable Items", "ok", f"{imported_count} linked item(s)."))
+
+    if batch_side_count is not None and imported_count is not None:
+        if batch_side_count != imported_count:
+            checks.append(
+                verification_check(
+                    "Batch reciprocal link",
+                    "error",
+                    f"Batch side shows {batch_side_count} item(s), item side shows {imported_count}.",
+                )
+            )
+        else:
+            checks.append(verification_check("Batch reciprocal link", "ok", f"{batch_side_count} item(s)."))
+    elif imported_count is not None:
+        checks.append(
+            verification_check(
+                "Batch reciprocal link",
+                "warn",
+                "Could not find a reciprocal linked item field on the Airtable batch record.",
+            )
+        )
+
+    if run_state == "succeeded" and remaining_input_count:
+        checks.append(
+            verification_check(
+                "Waiting files",
+                "warn",
+                f"{remaining_input_count} file(s) still waiting in to_process.",
+            )
+        )
+    elif run_state == "succeeded":
+        checks.append(verification_check("Waiting files", "ok", "No files left waiting in to_process."))
+
+    if unresolved_failure_count:
+        checks.append(
+            verification_check(
+                "Unresolved failures",
+                "warn",
+                f"{unresolved_failure_count} unresolved failed file(s).",
+            )
+        )
+    else:
+        checks.append(verification_check("Unresolved failures", "ok", "No unresolved failed files."))
+
+    if manifest.get("target_collection") and airtable.get("items_missing_collection"):
+        checks.append(
+            verification_check(
+                "Collection links",
+                "error",
+                f"{airtable['items_missing_collection']} item(s) missing the selected collection link.",
+            )
+        )
+    elif manifest.get("target_collection") and imported_count:
+        checks.append(verification_check("Collection links", "ok", "Imported items have collection links."))
+
+    if manifest.get("location") and airtable.get("items_missing_location"):
+        checks.append(
+            verification_check(
+                "Location links",
+                "error",
+                f"{airtable['items_missing_location']} item(s) missing the selected location link.",
+            )
+        )
+    elif manifest.get("location") and imported_count:
+        checks.append(verification_check("Location links", "ok", "Imported items have location links."))
+
+    if airtable.get("warning"):
+        checks.append(verification_check("Airtable verification", "warn", airtable["warning"]))
+
+    return checks
+
+
+def batch_verification_payload(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    manifest = read_batch_manifest(batch_id, bucket)
+    run_status = normalize_run_status_for_lock(
+        batch_id,
+        read_batch_run_status(batch_id, bucket),
+        bucket,
+    )
+    results = batch_results_counts(batch_id, bucket)
+    remaining_input_count = count_batch_uploads(batch_id, bucket)
+    unresolved_failures = batch_failure_rows(batch_id, bucket)
+    airtable = {
+        "batch_record_id": "",
+        "item_side_linked_count": None,
+        "batch_side_linked_count": None,
+        "batch_side_link_field": "",
+        "items_missing_collection": 0,
+        "items_missing_location": 0,
+        "warning": "",
+    }
+
+    try:
+        batch_record = get_airtable_batch_record(batch_id)
+        if batch_record:
+            item_records = airtable_item_records_for_batch(batch_record)
+            batch_side = batch_side_linked_item_summary(batch_record)
+            airtable.update({
+                "batch_record_id": batch_record.get("id", ""),
+                "item_side_linked_count": len(item_records),
+                "batch_side_linked_count": batch_side["count"],
+                "batch_side_link_field": batch_side["field"],
+                "items_missing_collection": count_items_missing_field(
+                    item_records,
+                    AIRTABLE_ITEM_COLLECTION_LINK_FIELD,
+                ),
+                "items_missing_location": count_items_missing_field(
+                    item_records,
+                    AIRTABLE_ITEM_LOCATION_LINK_FIELD,
+                ),
+            })
+        else:
+            airtable["warning"] = "No matching Airtable batch record found."
+    except Exception as error:
+        airtable["warning"] = str(error)
+
+    checks = build_batch_verification_checks(
+        run_status,
+        results,
+        remaining_input_count,
+        len(unresolved_failures),
+        airtable,
+        manifest,
+    )
+
+    return {
+        "batch_id": batch_id,
+        "bucket": DEFAULT_GCS_BUCKET,
+        "input_prefix": batch_input_prefix(batch_id),
+        "results_path": batch_results_path(batch_id),
+        "run_status": run_status,
+        "manifest": manifest,
+        "counts": {
+            "remaining_input_files": remaining_input_count,
+            "known_file_rows": results.get("total", 0) + remaining_input_count,
+            "csv_total_rows": results.get("total", 0),
+            "csv_success_rows": results.get("success", 0),
+            "csv_failed_rows": results.get("failed", 0),
+            "unresolved_failure_rows": len(unresolved_failures),
+            "airtable_item_records": airtable["item_side_linked_count"],
+            "batch_side_item_records": airtable["batch_side_linked_count"],
+        },
+        "airtable": airtable,
+        "checks": checks,
+        "overall_status": verification_overall_status(checks),
+    }
 
 
 def failure_retry_source_candidates(failure):
@@ -1217,6 +1525,14 @@ async def get_batch_failures(req: Request, batch_id: str):
         "count": len(failures),
         "failures": failures,
     }
+
+
+@app.get("/batches/{batch_id}/verification")
+async def get_batch_verification(req: Request, batch_id: str):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(batch_id)
+    return batch_verification_payload(batch_id)
 
 
 @app.post("/batches/{batch_id}/retry-failures")

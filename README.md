@@ -14,6 +14,9 @@ The page prompts for the API token in the browser and stores it in session stora
 Browser uploads use signed GCS `PUT` URLs, so the bucket must allow CORS for the
 Render origin before direct browser uploads will succeed.
 
+For day-to-day operating steps and smoke tests, see
+`PRODUCTION_RUNBOOK.md`.
+
 Collection and location dropdowns read from Airtable. The UI lets an operator
 choose existing values or add new ones before creating a batch. The importer
 then writes linked records into `Items` using these defaults:
@@ -86,6 +89,13 @@ Check batch status:
 
 ```bash
 curl "$EXTRACTOR_URL/batches/{batch_id}" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Verify a completed batch:
+
+```bash
+curl "$EXTRACTOR_URL/batches/{batch_id}/verification" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
