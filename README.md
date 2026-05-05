@@ -20,7 +20,7 @@ Create a batch:
 curl -X POST "$EXTRACTOR_URL/batches" \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"source":"web-upload"}'
+  -d '{"source":"web-upload","location":"Shelf A"}'
 ```
 
 Create a signed GCS upload URL:

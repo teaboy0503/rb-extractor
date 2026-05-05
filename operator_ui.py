@@ -452,6 +452,10 @@ OPERATOR_UI_HTML = """<!doctype html>
               <input id="collectionInput" type="text" placeholder="Optional">
             </label>
             <label>
+              Location
+              <input id="locationInput" type="text" placeholder="Optional">
+            </label>
+            <label>
               Notes
               <textarea id="notesInput" placeholder="Optional"></textarea>
             </label>
@@ -567,6 +571,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       accessStatus: el("accessStatus"),
       sourceInput: el("sourceInput"),
       collectionInput: el("collectionInput"),
+      locationInput: el("locationInput"),
       notesInput: el("notesInput"),
       createBatchBtn: el("createBatchBtn"),
       refreshBatchBtn: el("refreshBatchBtn"),
@@ -703,6 +708,7 @@ OPERATOR_UI_HTML = """<!doctype html>
           body: JSON.stringify({
             source: nodes.sourceInput.value.trim(),
             target_collection: nodes.collectionInput.value.trim(),
+            location: nodes.locationInput.value.trim(),
             notes: nodes.notesInput.value.trim()
           })
         });

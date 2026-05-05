@@ -42,6 +42,7 @@ class CreateBatchRequest(BaseModel):
     batch_id: str | None = None
     source: str | None = None
     target_collection: str | None = None
+    location: str | None = None
     notes: str | None = None
 
 
@@ -294,6 +295,7 @@ def batch_manifest(batch_id, body):
         "results_path": results_path,
         "source": body.source or "",
         "target_collection": body.target_collection or "",
+        "location": body.location or "",
         "notes": body.notes or "",
         "created_at": datetime.now(UTC).isoformat(),
         "run_command": batch_run_command(batch_id),
