@@ -273,6 +273,11 @@ OPERATOR_UI_HTML = """<!doctype html>
       background: #eef8f6;
     }
 
+    .dropzone.disabled {
+      opacity: 0.58;
+      cursor: not-allowed;
+    }
+
     .drop-title {
       font-weight: 720;
       margin-bottom: 6px;
@@ -629,7 +634,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
         <div class="panel">
           <div class="panel-head">
-            <h2>Batch</h2>
+            <h2>1. Batch Details</h2>
           </div>
           <div class="stack">
             <label>
@@ -686,7 +691,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       <section>
         <div class="panel">
           <div class="panel-head">
-            <h2>Current Batch</h2>
+            <h2>Active Batch</h2>
           </div>
           <div class="batch-meta">
             <div class="meta-item">
@@ -728,12 +733,13 @@ OPERATOR_UI_HTML = """<!doctype html>
 
         <div class="panel">
           <div class="panel-head">
-            <h2>Upload Files</h2>
+            <h2>2. Upload Files</h2>
             <label class="row">
               <input id="overwriteInput" type="checkbox" style="width:auto;">
               Overwrite
             </label>
           </div>
+          <div id="uploadBatchContext" class="status-line"></div>
           <input id="fileInput" class="hidden" type="file" accept="image/*" multiple>
           <div id="dropzone" class="dropzone">
             <div>
@@ -754,7 +760,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
         <div class="panel">
           <div class="panel-head">
-            <h2>Processing</h2>
+            <h2>3. Run Files</h2>
             <div class="row">
               <button id="runBatchBtn" type="button" class="primary" disabled>Run Batch</button>
               <button id="copyCommandBtn" type="button" disabled>Copy Command</button>
@@ -771,7 +777,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
         <div class="panel">
           <div class="panel-head">
-            <h2>Batch Verification</h2>
+            <h2>4. Verify</h2>
             <button id="refreshVerificationBtn" type="button" disabled>Refresh</button>
           </div>
           <div class="metrics">
@@ -863,6 +869,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       resultSuccess: el("resultSuccess"),
       resultFailed: el("resultFailed"),
       overwriteInput: el("overwriteInput"),
+      uploadBatchContext: el("uploadBatchContext"),
       fileInput: el("fileInput"),
       dropzone: el("dropzone"),
       chooseFilesBtn: el("chooseFilesBtn"),
@@ -1140,16 +1147,23 @@ OPERATOR_UI_HTML = """<!doctype html>
         state.verification = null;
         state.failures = [];
         renderRunStatus(null);
+        updateUploadButtons();
         renderVerification();
         renderFailures();
         return;
       }
 
+      const previousBatchId = state.batch?.batch_id || "";
+      const nextBatchId = data.batch_id || "";
       state.batch = data;
-      state.batchId = data.batch_id || "";
+      state.batchId = nextBatchId;
       if (state.batchId) {
         sessionStorage.setItem("rb_batch_id", state.batchId);
         nodes.existingBatchInput.value = state.batchId;
+      }
+      if (previousBatchId && nextBatchId && previousBatchId !== nextBatchId) {
+        clearSelectedFiles();
+        setStatus(nodes.uploadStatus, "Active batch changed; choose files for this batch.", "warn");
       }
       setLookupValue("collections", data.target_collection || "");
       setLookupValue("locations", data.location || "");
@@ -1172,6 +1186,9 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.refreshFailuresBtn.disabled = false;
       renderRunStatus(data.run);
       updateUploadButtons();
+      if (!state.files.length) {
+        renderFiles();
+      }
       renderBatchList();
       renderVerification();
       renderFailures();
@@ -1675,6 +1692,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         renderFailures();
         await listBatches(true);
         setStatus(nodes.batchStatus, `Created ${data.batch_id}.`, "ok");
+        setStatus(nodes.uploadStatus, "Batch ready. Choose files for this batch.", "ok");
       } catch (error) {
         setStatus(nodes.batchStatus, error.message, "error");
       } finally {
@@ -1712,6 +1730,11 @@ OPERATOR_UI_HTML = """<!doctype html>
     }
 
     function addFiles(fileList) {
+      if (!state.batch?.batch_id) {
+        setStatus(nodes.uploadStatus, "Create or load a batch before choosing files.", "warn");
+        return;
+      }
+
       const incoming = Array.from(fileList || []);
       const existingKeys = new Set(state.files.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
 
@@ -1747,7 +1770,11 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.fileList.innerHTML = "";
 
       if (!state.files.length) {
-        setStatus(nodes.uploadStatus, "No files selected.");
+        if (state.batch?.batch_id) {
+          setStatus(nodes.uploadStatus, "No files selected for the active batch.");
+        } else {
+          setStatus(nodes.uploadStatus, "Create or load a batch before choosing files.", "warn");
+        }
         return;
       }
 
@@ -1781,9 +1808,24 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
     }
 
+    function clearSelectedFiles() {
+      state.files = [];
+      state.uploads.clear();
+      nodes.fileInput.value = "";
+      renderFiles();
+      updateUploadButtons();
+    }
+
     function updateUploadButtons() {
       const hasBatch = Boolean(state.batch?.batch_id);
       const hasFiles = state.files.length > 0;
+      nodes.uploadBatchContext.textContent = hasBatch
+        ? `Files will upload to active batch ${state.batch.batch_id}.`
+        : "Create or load a batch before choosing files.";
+      nodes.uploadBatchContext.className = `status-line ${hasBatch ? "ok" : "warn"}`.trim();
+      nodes.chooseFilesBtn.disabled = !hasBatch || state.uploadInProgress;
+      nodes.fileInput.disabled = !hasBatch || state.uploadInProgress;
+      nodes.dropzone.classList.toggle("disabled", !hasBatch || state.uploadInProgress);
       nodes.uploadBtn.disabled = !hasBatch || !hasFiles || state.uploadInProgress;
       nodes.clearFilesBtn.disabled = !hasFiles || state.uploadInProgress;
       nodes.uploadBtn.textContent = state.uploadInProgress ? "Uploading..." : "Upload Selected";
@@ -2003,10 +2045,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.fileInput.addEventListener("change", (event) => addFiles(event.target.files));
       nodes.uploadBtn.addEventListener("click", uploadSelected);
       nodes.clearFilesBtn.addEventListener("click", () => {
-        state.files = [];
-        state.uploads.clear();
-        renderFiles();
-        updateUploadButtons();
+        clearSelectedFiles();
       });
       nodes.copyCommandBtn.addEventListener("click", copyCommand);
       nodes.copyErrorReportBtn.addEventListener("click", copyErrorReport);
@@ -2020,6 +2059,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       ["dragenter", "dragover"].forEach((eventName) => {
         nodes.dropzone.addEventListener(eventName, (event) => {
           event.preventDefault();
+          if (!state.batch?.batch_id) return;
           nodes.dropzone.classList.add("dragover");
         });
       });
@@ -2032,6 +2072,10 @@ OPERATOR_UI_HTML = """<!doctype html>
       });
 
       nodes.dropzone.addEventListener("drop", (event) => {
+        if (!state.batch?.batch_id) {
+          setStatus(nodes.uploadStatus, "Create or load a batch before dropping files.", "warn");
+          return;
+        }
         addFiles(event.dataTransfer.files);
       });
 
