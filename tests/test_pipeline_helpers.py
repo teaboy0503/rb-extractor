@@ -264,6 +264,24 @@ class LookupOptionsTests(unittest.TestCase):
         self.assertEqual(name, "Rare Books")
         self.assertEqual(field, "Name")
 
+    def test_merge_lookup_options_adds_legacy_names_without_duplicates(self):
+        result = {
+            "options": [{"id": "rec1", "name": "General"}],
+            "warnings": [],
+        }
+
+        added = app.merge_airtable_lookup_options(
+            result,
+            ["General", "Archive", "Rare Books"],
+            "legacy_collection_select",
+        )
+
+        self.assertEqual(added, 2)
+        self.assertEqual(
+            [option["name"] for option in result["options"]],
+            ["Archive", "General", "Rare Books"],
+        )
+
 
 class BatchVerificationTests(unittest.TestCase):
     def test_verification_checks_are_ok_when_counts_match(self):

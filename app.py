@@ -45,10 +45,11 @@ AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Re
 AIRTABLE_COLLECTIONS_TABLE_NAME = os.getenv("AIRTABLE_COLLECTIONS_TABLE_NAME", "Collections")
 AIRTABLE_COLLECTION_NAME_FIELD = os.getenv("AIRTABLE_COLLECTION_NAME_FIELD", "Collection name")
 AIRTABLE_ITEM_COLLECTION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_COLLECTION_LINK_FIELD", "Collection (linked)")
+AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD", "Collection")
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.1-lookup-options"
+APP_VERSION = "1.13.2-legacy-collection-options"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -120,6 +121,10 @@ def airtable_url(table_name, record_id=None):
     return base
 
 
+def airtable_meta_url():
+    return f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
+
+
 def airtable_formula_string(value):
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
@@ -151,6 +156,110 @@ def airtable_lookup_display_name(fields, preferred_field):
         return str(value).strip(), field_name
 
     return "", ""
+
+
+def add_unique_name(names, value):
+    value = (value or "").strip()
+    if not value:
+        return
+    key = value.lower()
+    if key not in {name.lower() for name in names}:
+        names.append(value)
+
+
+def list_airtable_field_values(table_name, field_name, limit=1000):
+    values = []
+    try:
+        records = list_airtable_records(table_name, limit=limit)
+    except Exception as error:
+        return {
+            "options": [],
+            "warnings": [f"Could not read values from {table_name}.{field_name}: {error}"],
+        }
+
+    for record in records:
+        value = record.get("fields", {}).get(field_name)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    add_unique_name(values, item)
+        elif value not in [None, ""]:
+            add_unique_name(values, str(value))
+
+    values.sort(key=str.lower)
+    return {"options": values, "warnings": []}
+
+
+def list_airtable_select_field_options(table_name, field_name):
+    require_airtable_config()
+    warnings = []
+
+    try:
+        response = requests.get(airtable_meta_url(), headers=airtable_headers(), timeout=60)
+    except Exception as error:
+        fallback = list_airtable_field_values(table_name, field_name)
+        return {
+            "options": fallback["options"],
+            "warnings": [f"Could not read Airtable schema options: {error}", *fallback["warnings"]],
+        }
+
+    if response.status_code == 403:
+        fallback = list_airtable_field_values(table_name, field_name)
+        return {
+            "options": fallback["options"],
+            "warnings": [
+                "Airtable token lacks schema.bases:read; using populated legacy collection values instead.",
+                *fallback["warnings"],
+            ],
+        }
+
+    if not response.ok:
+        fallback = list_airtable_field_values(table_name, field_name)
+        return {
+            "options": fallback["options"],
+            "warnings": [f"Airtable schema read failed: {response.text}", *fallback["warnings"]],
+        }
+
+    data = response.json()
+    for table in data.get("tables", []):
+        if table.get("name") != table_name:
+            continue
+        for field in table.get("fields", []):
+            if field.get("name") != field_name:
+                continue
+
+            values = []
+            for choice in field.get("options", {}).get("choices", []):
+                add_unique_name(values, choice.get("name"))
+
+            values.sort(key=str.lower)
+            return {"options": values, "warnings": warnings}
+
+    fallback = list_airtable_field_values(table_name, field_name)
+    return {
+        "options": fallback["options"],
+        "warnings": [
+            f"Could not find legacy field {table_name}.{field_name}; using populated values if available.",
+            *fallback["warnings"],
+        ],
+    }
+
+
+def merge_airtable_lookup_options(result, names, source):
+    existing = {option["name"].lower() for option in result["options"]}
+    added = 0
+
+    for name in names:
+        name = (name or "").strip()
+        key = name.lower()
+        if not name or key in existing:
+            continue
+        result["options"].append({"id": "", "name": name, "source": source})
+        existing.add(key)
+        added += 1
+
+    result["options"].sort(key=lambda option: option["name"].lower())
+    return added
 
 
 def list_airtable_lookup_options(kind, limit=1000):
@@ -1484,6 +1593,15 @@ async def get_airtable_options(req: Request):
     require_bearer_auth(req)
     collections = list_airtable_lookup_options("collections")
     locations = list_airtable_lookup_options("locations")
+    legacy_collections = list_airtable_select_field_options(AIRTABLE_TABLE_NAME, AIRTABLE_LEGACY_COLLECTION_FIELD)
+    legacy_added = merge_airtable_lookup_options(
+        collections,
+        legacy_collections["options"],
+        "legacy_collection_select",
+    )
+    collections["legacy_options_seen"] = len(legacy_collections["options"])
+    collections["legacy_options_added"] = legacy_added
+    collections["warnings"].extend(legacy_collections["warnings"])
 
     return {
         "collections": collections["options"],

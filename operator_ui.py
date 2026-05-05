@@ -1033,8 +1033,12 @@ OPERATOR_UI_HTML = """<!doctype html>
         ...(diagnostics.locations?.warnings || [])
       ];
       const counts = `Loaded ${collectionCount} collection${collectionCount === 1 ? "" : "s"} and ${locationCount} location${locationCount === 1 ? "" : "s"}.`;
+      const legacyAdded = diagnostics.collections?.legacy_options_added || 0;
+      const legacyText = legacyAdded
+        ? ` Included ${legacyAdded} legacy Collection select option${legacyAdded === 1 ? "" : "s"}.`
+        : "";
       return {
-        message: warnings.length ? `${counts} ${warnings.join(" ")}` : counts,
+        message: warnings.length ? `${counts}${legacyText} ${warnings.join(" ")}` : `${counts}${legacyText}`,
         type: warnings.length ? "warn" : "ok"
       };
     }
