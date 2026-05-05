@@ -66,3 +66,19 @@ curl -X POST "$EXTRACTOR_URL/batches/{batch_id}/run" \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
+
+List unresolved failed rows for a batch:
+
+```bash
+curl "$EXTRACTOR_URL/batches/{batch_id}/failures" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Queue failed files back into the same batch:
+
+```bash
+curl -X POST "$EXTRACTOR_URL/batches/{batch_id}/retry-failures" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"max_files":25}'
+```

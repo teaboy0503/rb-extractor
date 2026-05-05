@@ -28,7 +28,9 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 - Done: upload directly to GCS using signed upload URLs rather than proxying large file uploads through FastAPI.
 - Done: store new uploads under a batch-specific prefix such as `imports/{import_batch_id}/to_process/`.
 - Done: list recent operator batches in the UI so batches can be recovered after refresh.
-- Add UI support for viewing failed rows and sending selected failures back through the retry workflow.
+- Done: add UI support for viewing unresolved failed rows for the selected batch.
+- Done: add UI support for queueing all unresolved failed files back into the selected batch.
+- Later: add selectable per-file retry controls once there are enough failures to need finer control.
 - Consider resumable browser uploads for very large files or unreliable connections.
 - Add lightweight upload validation in the UI, for example file type, duplicate filename warnings, and total batch size.
 

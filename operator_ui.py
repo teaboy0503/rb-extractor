@@ -333,6 +333,33 @@ OPERATOR_UI_HTML = """<!doctype html>
       background: #ffffff;
     }
 
+    .failure-list {
+      display: grid;
+      gap: 8px;
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .failure-row {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #ffffff;
+    }
+
+    .failure-title {
+      font-weight: 720;
+      overflow-wrap: anywhere;
+    }
+
+    .failure-detail {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+    }
+
     .file-name {
       font-weight: 650;
       overflow-wrap: anywhere;
@@ -672,6 +699,18 @@ OPERATOR_UI_HTML = """<!doctype html>
           </div>
           <pre id="runLog" class="run-log hidden"></pre>
         </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Failures</h2>
+            <div class="row">
+              <button id="refreshFailuresBtn" type="button" disabled>Refresh</button>
+              <button id="retryFailuresBtn" type="button" disabled>Retry Failed Files</button>
+            </div>
+          </div>
+          <div id="failureStatus" class="status-line"></div>
+          <div id="failureList" class="failure-list"></div>
+        </div>
       </section>
     </section>
   </main>
@@ -683,6 +722,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       batchId: sessionStorage.getItem("rb_batch_id") || "",
       batch: null,
       batches: [],
+      failures: [],
       runPollTimer: null,
       files: [],
       uploads: new Map()
@@ -731,7 +771,11 @@ OPERATOR_UI_HTML = """<!doctype html>
       runSteps: el("runSteps"),
       runCommand: el("runCommand"),
       runLog: el("runLog"),
-      copyCommandBtn: el("copyCommandBtn")
+      copyCommandBtn: el("copyCommandBtn"),
+      refreshFailuresBtn: el("refreshFailuresBtn"),
+      retryFailuresBtn: el("retryFailuresBtn"),
+      failureStatus: el("failureStatus"),
+      failureList: el("failureList")
     };
 
     function setStatus(node, message, type = "") {
@@ -823,7 +867,10 @@ OPERATOR_UI_HTML = """<!doctype html>
         nodes.runBatchBtn.textContent = "Run Batch";
         nodes.runBatchBtn.title = "";
         nodes.copyCommandBtn.disabled = true;
+        nodes.refreshFailuresBtn.disabled = true;
+        state.failures = [];
         renderRunStatus(null);
+        renderFailures();
         return;
       }
 
@@ -847,9 +894,11 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.runBatchBtn.textContent = runButtonLabel(data);
       nodes.runBatchBtn.title = runButtonTitle(data);
       nodes.copyCommandBtn.disabled = !data.run_command;
+      nodes.refreshFailuresBtn.disabled = false;
       renderRunStatus(data.run);
       updateUploadButtons();
       renderBatchList();
+      renderFailures();
     }
 
     function runButtonLabel(data) {
@@ -882,6 +931,7 @@ OPERATOR_UI_HTML = """<!doctype html>
           if (!state.batch?.batch_id) return;
           await loadBatch(state.batch.batch_id, true);
           await listBatches(true);
+          await loadFailures(true);
         }, 5000);
       } else if (!active && state.runPollTimer) {
         window.clearInterval(state.runPollTimer);
@@ -1077,6 +1127,109 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
     }
 
+    function renderFailures() {
+      nodes.failureList.innerHTML = "";
+      const isRunning = state.batch?.run?.status === "running";
+      const queuedForRetry = state.failures.filter((failure) => failure.retry_queued).length;
+      nodes.retryFailuresBtn.disabled = !state.batch?.batch_id || isRunning || state.failures.length < 1 || queuedForRetry === state.failures.length;
+      nodes.refreshFailuresBtn.disabled = !state.batch?.batch_id;
+
+      if (!state.batch?.batch_id) {
+        setStatus(nodes.failureStatus, "Load a batch to see failures.");
+        return;
+      }
+
+      if (!state.failures.length) {
+        setStatus(nodes.failureStatus, "No unresolved failed files for this batch.", "ok");
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.textContent = "Failures from successful retry rows are hidden here.";
+        nodes.failureList.appendChild(empty);
+        return;
+      }
+
+      setStatus(
+        nodes.failureStatus,
+        `${state.failures.length} unresolved failed file${state.failures.length === 1 ? "" : "s"}${queuedForRetry ? `, ${queuedForRetry} queued for retry` : ""}.`,
+        "warn"
+      );
+
+      for (const failure of state.failures) {
+        const row = document.createElement("div");
+        row.className = "failure-row";
+
+        const title = document.createElement("div");
+        title.className = "failure-title";
+        title.textContent = failure.filename || failure.key || "Unknown file";
+
+        const path = document.createElement("div");
+        path.className = "failure-detail mono";
+        path.textContent = failure.retry_queued
+          ? `Queued: ${failure.retry_path}`
+          : failure.final_gcs_path || failure.source_gcs_path || "";
+
+        const detail = document.createElement("div");
+        detail.className = "failure-detail";
+        detail.textContent = failure.error || "No error message recorded.";
+
+        row.append(title, path, detail);
+        nodes.failureList.appendChild(row);
+      }
+    }
+
+    async function loadFailures(quiet = false) {
+      if (!state.batch?.batch_id) {
+        state.failures = [];
+        renderFailures();
+        return;
+      }
+
+      if (!quiet) {
+        setStatus(nodes.failureStatus, "Loading failures...");
+      }
+      nodes.refreshFailuresBtn.disabled = true;
+
+      try {
+        const data = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/failures`);
+        state.failures = data.failures || [];
+        renderFailures();
+      } catch (error) {
+        if (!quiet) {
+          setStatus(nodes.failureStatus, error.message, "error");
+        }
+      } finally {
+        nodes.refreshFailuresBtn.disabled = !state.batch?.batch_id;
+      }
+    }
+
+    async function retryFailures() {
+      if (!state.batch?.batch_id || !state.failures.length) return;
+      saveAccess();
+      nodes.retryFailuresBtn.disabled = true;
+      setStatus(nodes.failureStatus, "Queueing failed files for retry...", "warn");
+
+      try {
+        const data = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/retry-failures`, {
+          method: "POST",
+          body: JSON.stringify({ max_files: 100 })
+        });
+        state.batch = data.batch || state.batch;
+        state.failures = data.failures || [];
+        updateBatchView(state.batch);
+        renderFailures();
+        await listBatches(true);
+        const queued = data.summary?.queued || 0;
+        const alreadyQueued = data.summary?.already_queued || 0;
+        setStatus(
+          nodes.failureStatus,
+          `Queued ${queued} file${queued === 1 ? "" : "s"} for retry${alreadyQueued ? `, ${alreadyQueued} already queued` : ""}. Click Run Batch when ready.`,
+          queued || alreadyQueued ? "ok" : "warn"
+        );
+      } catch (error) {
+        setStatus(nodes.failureStatus, error.message, "error");
+      }
+    }
+
     async function listBatches(quiet = false) {
       saveAccess();
       if (!quiet) {
@@ -1114,6 +1267,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       try {
         const data = await apiFetch(`/batches/${encodeURIComponent(trimmedBatchId)}`);
         updateBatchView(data);
+        await loadFailures(true);
         if (!quiet) {
           setStatus(nodes.batchStatus, `Loaded ${trimmedBatchId}.`, "ok");
         }
@@ -1146,6 +1300,8 @@ OPERATOR_UI_HTML = """<!doctype html>
           uploaded_count: 0,
           results: { exists: false, total: 0, success: 0, failed: 0 }
         });
+        state.failures = [];
+        renderFailures();
         await listBatches(true);
         setStatus(nodes.batchStatus, `Created ${data.batch_id}.`, "ok");
       } catch (error) {
@@ -1172,6 +1328,7 @@ OPERATOR_UI_HTML = """<!doctype html>
           body: JSON.stringify({})
         });
         updateBatchView(data);
+        await loadFailures(true);
         await listBatches(true);
       } catch (error) {
         setStatus(nodes.runStatus, error.message, "error");
@@ -1362,6 +1519,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.existingBatchInput.value = state.batchId;
       updateBatchView(null);
       renderBatchList();
+      renderFailures();
       renderFiles();
 
       nodes.saveAccessBtn.addEventListener("click", saveAccess);
@@ -1372,6 +1530,8 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.loadBatchBtn.addEventListener("click", () => loadBatch(nodes.existingBatchInput.value));
       nodes.listBatchesBtn.addEventListener("click", () => listBatches());
       nodes.runBatchBtn.addEventListener("click", runBatch);
+      nodes.refreshFailuresBtn.addEventListener("click", () => loadFailures());
+      nodes.retryFailuresBtn.addEventListener("click", retryFailures);
       nodes.chooseFilesBtn.addEventListener("click", () => nodes.fileInput.click());
       nodes.fileInput.addEventListener("change", (event) => addFiles(event.target.files));
       nodes.uploadBtn.addEventListener("click", uploadSelected);

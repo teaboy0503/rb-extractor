@@ -35,7 +35,7 @@ DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
 SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUTES", "60"))
 BATCH_RUN_LOCK_TTL_SECONDS = int(os.getenv("BATCH_RUN_LOCK_TTL_SECONDS", "21600"))
-APP_VERSION = "1.11.0-operator-locks"
+APP_VERSION = "1.12.0-operator-failures"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -61,6 +61,10 @@ class CreateUploadUrlRequest(BaseModel):
 
 class RunBatchRequest(BaseModel):
     force: bool = False
+
+
+class RetryFailuresRequest(BaseModel):
+    max_files: int = 25
 
 
 def require_bearer_auth(req: Request) -> None:
@@ -389,6 +393,179 @@ def batch_results_counts(batch_id, bucket=None):
             counts["failed"] += 1
 
     return counts
+
+
+def download_batch_results_rows(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    blob = bucket.blob(batch_results_path(batch_id))
+
+    if not blob.exists():
+        return []
+
+    content = blob.download_as_text(encoding="utf-8")
+    return list(csv.DictReader(content.splitlines()))
+
+
+def sanitize_error_message(value, limit=700):
+    value = (value or "").strip()
+    value = re.sub(
+        r"https://storage\.googleapis\.com/([^?\s'\"]+)\?[^'\"]+",
+        r"gs://\1",
+        value,
+    )
+    value = re.sub(r"X-Goog-[A-Za-z0-9_-]+=[^&\s'\"]+", "X-Goog-...=redacted", value)
+
+    if len(value) > limit:
+        return f"{value[:limit].rstrip()}..."
+
+    return value
+
+
+def failure_key_for_row(row):
+    return (
+        row.get("source_gcs_path")
+        or row.get("Original filename")
+        or row.get("final_gcs_path")
+        or row.get("GCS object path")
+        or ""
+    ).strip()
+
+
+def row_original_filename(row):
+    return (
+        row.get("Original filename")
+        or (row.get("source_gcs_path") or "").split("/")[-1]
+        or (row.get("final_gcs_path") or "").split("/")[-1]
+        or ""
+    ).strip()
+
+
+def batch_failure_rows(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    rows = download_batch_results_rows(batch_id, bucket)
+    states = {}
+
+    for index, row in enumerate(rows):
+        key = failure_key_for_row(row)
+        if not key:
+            continue
+
+        status = (row.get("status") or "").strip().lower()
+        if status == "success":
+            states[key] = {"status": "success", "row": row, "index": index}
+        elif status == "failed":
+            states[key] = {"status": "failed", "row": row, "index": index}
+
+    failures = []
+    for key, state in states.items():
+        if state["status"] != "failed":
+            continue
+
+        row = state["row"]
+        filename = row_original_filename(row)
+        final_path = (row.get("final_gcs_path") or row.get("GCS object path") or "").strip()
+        source_path = (row.get("source_gcs_path") or "").strip()
+        retry_path = f"{batch_input_prefix(batch_id)}{filename}" if filename else ""
+
+        failures.append(
+            {
+                "key": key,
+                "filename": filename,
+                "source_gcs_path": source_path,
+                "final_gcs_path": final_path,
+                "error": sanitize_error_message(row.get("error")),
+                "attempts": row.get("extraction_attempts") or "",
+                "processed_at": row.get("processed_at") or "",
+                "retry_queued": bool(retry_path and bucket.blob(retry_path).exists()),
+                "retry_path": retry_path,
+            }
+        )
+
+    failures.sort(key=lambda item: item.get("processed_at") or "")
+    return failures
+
+
+def failure_retry_source_candidates(failure):
+    filename = (failure.get("filename") or "").strip()
+    candidates = []
+
+    def add(path):
+        path = (path or "").strip()
+        if path and path not in candidates:
+            candidates.append(path)
+
+    add(failure.get("final_gcs_path"))
+    add(failure.get("source_gcs_path"))
+
+    if filename:
+        add(f"{normalize_prefix(os.getenv('BATCH_FAILED_PREFIX', 'failed/'))}{filename}")
+        add(f"{normalize_prefix(os.getenv('BATCH_PROCESSED_PREFIX', 'processed/'))}{filename}")
+
+    return candidates
+
+
+def retry_batch_failures(batch_id, max_files, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    failures = batch_failure_rows(batch_id, bucket)
+    max_files = max(1, min(int(max_files or 25), 100))
+    summary = {
+        "queued": 0,
+        "already_queued": 0,
+        "already_processed": 0,
+        "missing_source": 0,
+        "skipped": 0,
+    }
+    results = []
+    input_prefix = batch_input_prefix(batch_id)
+
+    for failure in failures[:max_files]:
+        filename = failure.get("filename")
+        destination_path = f"{input_prefix}{filename}" if filename else ""
+        destination_blob = bucket.blob(destination_path) if destination_path else None
+        source_blob = None
+
+        if destination_blob and destination_blob.exists():
+            status = "already_queued"
+            summary[status] += 1
+            results.append({**failure, "retry_status": status, "retry_path": destination_path})
+            continue
+
+        for candidate in failure_retry_source_candidates(failure):
+            blob = bucket.blob(candidate)
+            if blob.exists():
+                source_blob = blob
+                break
+
+        if not source_blob:
+            status = "missing_source"
+            summary[status] += 1
+            results.append({**failure, "retry_status": status, "retry_path": destination_path})
+            continue
+
+        if source_blob.name.startswith(normalize_prefix(os.getenv("BATCH_PROCESSED_PREFIX", "processed/"))):
+            status = "already_processed"
+            summary[status] += 1
+            results.append({**failure, "retry_status": status, "retry_path": source_blob.name})
+            continue
+
+        if not destination_blob:
+            status = "skipped"
+            summary[status] += 1
+            results.append({**failure, "retry_status": status, "retry_path": ""})
+            continue
+
+        bucket.copy_blob(source_blob, bucket, destination_path)
+        source_blob.delete()
+        status = "queued"
+        summary[status] += 1
+        results.append({**failure, "retry_status": status, "retry_path": destination_path})
+
+    return {
+        "batch_id": batch_id,
+        "summary": summary,
+        "results": results,
+        "remaining_failures": max(0, len(failures) - len(results)),
+    }
 
 
 def batch_status_payload(batch_id, bucket=None):
@@ -854,6 +1031,45 @@ async def get_batch_status(req: Request, batch_id: str):
 
     batch_id = validate_batch_id(batch_id)
     return batch_status_payload(batch_id)
+
+
+@app.get("/batches/{batch_id}/failures")
+async def get_batch_failures(req: Request, batch_id: str):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(batch_id)
+    failures = batch_failure_rows(batch_id)
+
+    return {
+        "batch_id": batch_id,
+        "count": len(failures),
+        "failures": failures,
+    }
+
+
+@app.post("/batches/{batch_id}/retry-failures")
+async def retry_failures(req: Request, batch_id: str, body: RetryFailuresRequest | None = None):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(batch_id)
+    body = body or RetryFailuresRequest()
+    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    current_run = normalize_run_status_for_lock(
+        batch_id,
+        read_batch_run_status(batch_id, bucket),
+        bucket,
+    )
+
+    if current_run.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Wait for the active run to finish before retrying failures")
+
+    retry_result = retry_batch_failures(batch_id, body.max_files, bucket)
+
+    return {
+        **retry_result,
+        "batch": batch_status_payload(batch_id, bucket),
+        "failures": batch_failure_rows(batch_id, bucket),
+    }
 
 
 @app.post("/batches/{batch_id}/run")
