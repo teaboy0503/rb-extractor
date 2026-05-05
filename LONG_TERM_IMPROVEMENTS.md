@@ -53,6 +53,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 
 - Profile 50, 250, and 500 file runs so slow stages are measured rather than guessed.
 - Tune `SLEEP_SECONDS` downward once extractor/OpenAI/Airtable rate limits are understood.
+- Tune `EXTRACTOR_TIMEOUT_SECONDS`, `MAX_EXTRACTOR_ATTEMPTS`, and timeout retry behaviour separately for scale tests vs production runs.
 - Add configurable extraction concurrency so multiple files can be OCR/LLM processed in parallel with safe retry/backoff.
 - Batch Airtable create/update calls where safe, respecting Airtable's API limits.
 - Avoid full Airtable table scans on every import by using targeted lookups or a local per-run cache.

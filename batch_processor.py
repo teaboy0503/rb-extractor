@@ -25,6 +25,8 @@ EXTRACTOR_API_KEY = os.getenv("API_KEY", "")
 MAX_FILES = int(os.getenv("MAX_FILES", "3"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1.5"))
 MAX_EXTRACTOR_ATTEMPTS = max(1, int(os.getenv("MAX_EXTRACTOR_ATTEMPTS", "3")))
+EXTRACTOR_TIMEOUT_SECONDS = float(os.getenv("EXTRACTOR_TIMEOUT_SECONDS", "180"))
+RETRY_EXTRACTOR_TIMEOUTS = os.getenv("RETRY_EXTRACTOR_TIMEOUTS", "").strip().lower() in {"1", "true", "yes"}
 RETRY_SLEEP_SECONDS = float(os.getenv("RETRY_SLEEP_SECONDS", "5"))
 MIN_SUCCESS_OCR_LENGTH = int(os.getenv("MIN_SUCCESS_OCR_LENGTH", "20"))
 
@@ -93,7 +95,7 @@ def call_extractor(blob_name):
             "Authorization": f"Bearer {EXTRACTOR_API_KEY}",
         },
         json=payload,
-        timeout=180,
+        timeout=EXTRACTOR_TIMEOUT_SECONDS,
     )
 
     if not response.ok:
@@ -103,6 +105,8 @@ def call_extractor(blob_name):
 
 
 def should_retry_extractor_error(error):
+    if isinstance(error, requests.exceptions.ReadTimeout):
+        return RETRY_EXTRACTOR_TIMEOUTS
     if isinstance(error, ExtractorError):
         return error.status_code == 429 or error.status_code >= 500
     return True
@@ -295,6 +299,8 @@ def main():
     print(f"Max files: {MAX_FILES}")
     print(f"Sleep seconds: {SLEEP_SECONDS}")
     print(f"Max extractor attempts: {MAX_EXTRACTOR_ATTEMPTS}")
+    print(f"Extractor timeout seconds: {EXTRACTOR_TIMEOUT_SECONDS}")
+    print(f"Retry extractor timeouts: {RETRY_EXTRACTOR_TIMEOUTS}")
     print(f"Minimum success OCR length: {MIN_SUCCESS_OCR_LENGTH}")
 
     blobs = list_input_blobs()

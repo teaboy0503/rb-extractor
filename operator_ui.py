@@ -511,6 +511,14 @@ OPERATOR_UI_HTML = """<!doctype html>
       font-size: 11px;
     }
 
+    .report-box {
+      min-height: 220px;
+      margin-top: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 11px;
+      white-space: pre-wrap;
+    }
+
     .step-list {
       display: grid;
       gap: 8px;
@@ -785,6 +793,7 @@ OPERATOR_UI_HTML = """<!doctype html>
             <pre id="runCommand">Create a batch to generate the command.</pre>
           </div>
           <pre id="runLog" class="run-log hidden"></pre>
+          <textarea id="errorReportText" class="report-box hidden" readonly></textarea>
         </div>
 
         <div class="panel">
@@ -895,6 +904,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       runSteps: el("runSteps"),
       runCommand: el("runCommand"),
       runLog: el("runLog"),
+      errorReportText: el("errorReportText"),
       copyCommandBtn: el("copyCommandBtn"),
       copyErrorReportBtn: el("copyErrorReportBtn"),
       refreshVerificationBtn: el("refreshVerificationBtn"),
@@ -2053,10 +2063,44 @@ OPERATOR_UI_HTML = """<!doctype html>
       if (!command) return;
 
       try {
-        await navigator.clipboard.writeText(command);
+        await copyText(command);
         setStatus(nodes.batchStatus, "Command copied.", "ok");
       } catch {
         setStatus(nodes.batchStatus, "Could not copy command.", "warn");
+      }
+    }
+
+    async function copyText(text) {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+
+      return false;
+    }
+
+    function showErrorReport(report) {
+      nodes.errorReportText.value = report;
+      nodes.errorReportText.classList.remove("hidden");
+      nodes.errorReportText.focus();
+      nodes.errorReportText.select();
+    }
+
+    async function copyOrShowErrorReport(report) {
+      showErrorReport(report);
+
+      try {
+        if (await copyText(report)) {
+          return true;
+        }
+      } catch {
+        // Keep the selected report visible as a manual fallback.
+      }
+
+      try {
+        return document.execCommand("copy");
+      } catch {
+        return false;
       }
     }
 
@@ -2099,10 +2143,17 @@ OPERATOR_UI_HTML = """<!doctype html>
           await loadVerification(true);
         }
         const logData = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/log`);
-        await navigator.clipboard.writeText(errorReportFromData(logData));
-        setStatus(nodes.runStatus, "Error report copied.", "ok");
+        const report = errorReportFromData(logData);
+        const copied = await copyOrShowErrorReport(report);
+        setStatus(
+          nodes.runStatus,
+          copied ? "Error report copied." : "Error report shown below. Select and copy it manually.",
+          copied ? "ok" : "warn"
+        );
       } catch (error) {
-        setStatus(nodes.runStatus, `Could not copy error report: ${error.message}`, "error");
+        const report = errorReportFromData({});
+        showErrorReport(`${report}\\n\\nReport copy error: ${error.message}`);
+        setStatus(nodes.runStatus, "Error report shown below with the copy error.", "warn");
       } finally {
         nodes.copyErrorReportBtn.disabled = !state.batch?.batch_id;
       }
