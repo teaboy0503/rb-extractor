@@ -363,6 +363,48 @@ class BatchVerificationTests(unittest.TestCase):
 
         self.assertEqual(app.verification_overall_status(checks), "warn")
 
+    def test_verification_ignores_already_successful_input_files(self):
+        checks = app.build_batch_verification_checks(
+            {"status": "succeeded"},
+            {"exists": True, "total": 1, "success": 1, "failed": 0},
+            0,
+            0,
+            {
+                "item_side_linked_count": 1,
+                "batch_side_linked_count": 1,
+                "items_missing_collection": 0,
+                "items_missing_location": 0,
+                "warning": "",
+            },
+            {},
+            already_successful_input_count=4,
+        )
+
+        self.assertEqual(app.verification_overall_status(checks), "ok")
+        waiting_check = next(check for check in checks if check["label"] == "Waiting files")
+        self.assertIn("ignored 4 already-successful", waiting_check["detail"])
+
+    def test_successful_source_gcs_paths_uses_only_successful_rows(self):
+        rows = [
+            {
+                "status": "success",
+                "source_gcs_path": "imports/batch-1/to_process/IMG_0001.jpg",
+            },
+            {
+                "status": "failed",
+                "source_gcs_path": "imports/batch-1/to_process/IMG_0002.jpg",
+            },
+            {
+                "status": "success",
+                "source_gcs_path": "",
+            },
+        ]
+
+        self.assertEqual(
+            app.successful_source_gcs_paths(rows),
+            {"imports/batch-1/to_process/IMG_0001.jpg"},
+        )
+
 
 class FailureRetryTests(unittest.TestCase):
     def setUp(self):

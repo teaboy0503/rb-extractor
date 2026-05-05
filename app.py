@@ -49,7 +49,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.4-metadata-heal"
+APP_VERSION = "1.13.5-verification-waiting-files"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -790,15 +790,19 @@ def read_batch_manifest(batch_id, bucket=None):
 
 
 def count_batch_uploads(batch_id, bucket=None):
+    return len(list_batch_input_blob_names(batch_id, bucket))
+
+
+def list_batch_input_blob_names(batch_id, bucket=None):
     bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
     prefix = batch_input_prefix(batch_id)
-    count = 0
+    names = []
 
     for blob in bucket.client.list_blobs(DEFAULT_GCS_BUCKET, prefix=prefix):
         if not blob.name.endswith("/"):
-            count += 1
+            names.append(blob.name)
 
-    return count
+    return names
 
 
 def batch_results_counts(batch_id, bucket=None):
@@ -841,6 +845,40 @@ def download_batch_results_rows(batch_id, bucket=None):
 
     content = blob.download_as_text(encoding="utf-8")
     return list(csv.DictReader(content.splitlines()))
+
+
+def successful_source_gcs_paths(rows):
+    paths = set()
+
+    for row in rows:
+        status = (row.get("status") or "").strip().lower()
+        source_path = (row.get("source_gcs_path") or "").strip()
+        if status == "success" and source_path:
+            paths.add(source_path)
+
+    return paths
+
+
+def batch_waiting_input_summary(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    input_paths = list_batch_input_blob_names(batch_id, bucket)
+    successful_sources = successful_source_gcs_paths(
+        download_batch_results_rows(batch_id, bucket)
+    )
+    waiting = []
+    already_successful = []
+
+    for path in input_paths:
+        if path in successful_sources:
+            already_successful.append(path)
+        else:
+            waiting.append(path)
+
+    return {
+        "input_count": len(input_paths),
+        "waiting": waiting,
+        "already_successful": already_successful,
+    }
 
 
 def sanitize_error_message(value, limit=700):
@@ -946,6 +984,7 @@ def build_batch_verification_checks(
     unresolved_failure_count,
     airtable,
     manifest,
+    already_successful_input_count=0,
 ):
     checks = []
     run_state = (run_status or {}).get("status", "not_started")
@@ -1009,6 +1048,17 @@ def build_batch_verification_checks(
                 f"{remaining_input_count} file(s) still waiting in to_process.",
             )
         )
+    elif run_state == "succeeded" and already_successful_input_count:
+        checks.append(
+            verification_check(
+                "Waiting files",
+                "ok",
+                (
+                    "No unprocessed files waiting; ignored "
+                    f"{already_successful_input_count} already-successful input file(s)."
+                ),
+            )
+        )
     elif run_state == "succeeded":
         checks.append(verification_check("Waiting files", "ok", "No files left waiting in to_process."))
 
@@ -1060,7 +1110,9 @@ def batch_verification_payload(batch_id, bucket=None):
         bucket,
     )
     results = batch_results_counts(batch_id, bucket)
-    remaining_input_count = count_batch_uploads(batch_id, bucket)
+    input_summary = batch_waiting_input_summary(batch_id, bucket)
+    remaining_input_count = len(input_summary["waiting"])
+    already_successful_input_count = len(input_summary["already_successful"])
     unresolved_failures = batch_failure_rows(batch_id, bucket)
     airtable = {
         "batch_record_id": "",
@@ -1131,6 +1183,7 @@ def batch_verification_payload(batch_id, bucket=None):
         len(unresolved_failures),
         airtable,
         manifest,
+        already_successful_input_count,
     )
 
     return {
@@ -1143,6 +1196,8 @@ def batch_verification_payload(batch_id, bucket=None):
         "counts": {
             "remaining_input_files": remaining_input_count,
             "known_file_rows": results.get("total", 0) + remaining_input_count,
+            "input_files_seen": input_summary["input_count"],
+            "already_successful_input_files": already_successful_input_count,
             "csv_total_rows": results.get("total", 0),
             "csv_success_rows": results.get("success", 0),
             "csv_failed_rows": results.get("failed", 0),
@@ -1150,6 +1205,8 @@ def batch_verification_payload(batch_id, bucket=None):
             "airtable_item_records": airtable["item_side_linked_count"],
             "batch_side_item_records": airtable["batch_side_linked_count"],
         },
+        "waiting_input_examples": input_summary["waiting"][:5],
+        "already_successful_input_examples": input_summary["already_successful"][:5],
         "airtable": airtable,
         "checks": checks,
         "overall_status": verification_overall_status(checks),
