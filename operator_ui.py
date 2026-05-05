@@ -144,7 +144,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     .layout {
       display: grid;
-      grid-template-columns: 360px minmax(0, 1fr);
+      grid-template-columns: 320px minmax(0, 1fr);
       gap: 16px;
       align-items: start;
     }
@@ -645,6 +645,19 @@ OPERATOR_UI_HTML = """<!doctype html>
 
         <div class="panel">
           <div class="panel-head">
+            <h2>Recent Batches</h2>
+            <button id="listBatchesBtn" type="button">Refresh</button>
+          </div>
+          <div class="stack">
+            <div id="batchListStatus" class="status-line"></div>
+            <div id="batchList" class="batch-list"></div>
+          </div>
+        </div>
+      </aside>
+
+      <section>
+        <div class="panel">
+          <div class="panel-head">
             <h2>1. Batch Details</h2>
           </div>
           <div class="stack">
@@ -687,19 +700,6 @@ OPERATOR_UI_HTML = """<!doctype html>
           </div>
         </div>
 
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Recent Batches</h2>
-            <button id="listBatchesBtn" type="button">Refresh</button>
-          </div>
-          <div class="stack">
-            <div id="batchListStatus" class="status-line"></div>
-            <div id="batchList" class="batch-list"></div>
-          </div>
-        </div>
-      </aside>
-
-      <section>
         <div class="panel">
           <div class="panel-head">
             <h2>Active Batch</h2>
