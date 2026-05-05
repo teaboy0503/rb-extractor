@@ -308,6 +308,9 @@ class LookupOptionsTests(unittest.TestCase):
 
 
 class BatchVerificationTests(unittest.TestCase):
+    def test_stopped_batch_can_be_started_again_without_waiting_uploads(self):
+        self.assertTrue(app.can_start_batch_run({"status": "stopped"}, 0))
+
     def test_verification_checks_are_ok_when_counts_match(self):
         checks = app.build_batch_verification_checks(
             {"status": "succeeded"},
@@ -386,6 +389,26 @@ class BatchVerificationTests(unittest.TestCase):
         self.assertIn("queued or processing", waiting_check["detail"])
         self.assertNotIn("run the batch again", waiting_check["detail"])
         self.assertIn("after the import step", airtable_check["detail"])
+
+    def test_verification_reports_stopped_batch_waiting_files(self):
+        checks = app.build_batch_verification_checks(
+            {"status": "stopped"},
+            {"exists": True, "total": 3, "success": 3, "failed": 0},
+            2,
+            0,
+            {
+                "item_side_linked_count": 3,
+                "batch_side_linked_count": 3,
+                "items_missing_collection": 0,
+                "items_missing_location": 0,
+                "warning": "",
+            },
+            {},
+        )
+
+        waiting_check = next(check for check in checks if check["label"] == "Waiting files")
+        self.assertIn("Batch was stopped", waiting_check["detail"])
+        self.assertEqual(app.verification_overall_status(checks), "warn")
 
     def test_verification_ignores_already_successful_input_files(self):
         checks = app.build_batch_verification_checks(

@@ -4,6 +4,7 @@ import io
 import os
 import json
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -49,9 +50,12 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.8-running-verification"
+APP_VERSION = "1.13.9-stop-batch-runs"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
+
+RUNNING_BATCH_PROCESSES = {}
+RUNNING_BATCH_PROCESS_LOCK = threading.Lock()
 
 
 class ExtractRequest(BaseModel):
@@ -572,6 +576,10 @@ def batch_run_lock_path(batch_id):
     return f"{batch_root_prefix(batch_id)}run.lock.json"
 
 
+def batch_run_stop_path(batch_id):
+    return f"{batch_root_prefix(batch_id)}run_stop.json"
+
+
 def batch_run_command(batch_id):
     input_prefix = batch_input_prefix(batch_id)
     results_path = batch_results_path(batch_id)
@@ -1087,6 +1095,14 @@ def build_batch_verification_checks(
                 ),
             )
         )
+    elif run_state == "stopped" and remaining_input_count:
+        checks.append(
+            verification_check(
+                "Waiting files",
+                "warn",
+                f"Batch was stopped with {remaining_input_count} file(s) still waiting. Run the batch again to continue.",
+            )
+        )
     elif run_state == "succeeded" and already_successful_input_count:
         checks.append(
             verification_check(
@@ -1474,6 +1490,48 @@ def release_batch_run_lock(batch_id, run_id, bucket=None):
         pass
 
 
+def read_batch_stop_request(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    blob = bucket.blob(batch_run_stop_path(batch_id))
+
+    if not blob.exists():
+        return None
+
+    try:
+        return json.loads(blob.download_as_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def write_batch_stop_request(batch_id, run_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    payload = {
+        "batch_id": batch_id,
+        "run_id": run_id,
+        "requested_at": datetime.now(UTC).isoformat(),
+    }
+    bucket.blob(batch_run_stop_path(batch_id)).upload_from_string(
+        json.dumps(payload, indent=2),
+        content_type="application/json",
+    )
+    return payload
+
+
+def clear_batch_stop_request(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    try:
+        bucket.blob(batch_run_stop_path(batch_id)).delete()
+    except NotFound:
+        pass
+
+
+def stop_requested_for_run(batch_id, run_id, bucket=None):
+    request = read_batch_stop_request(batch_id, bucket)
+    if not request:
+        return False
+    return not request.get("run_id") or request.get("run_id") == run_id
+
+
 def read_batch_run_status(batch_id, bucket=None):
     bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
     blob = bucket.blob(batch_run_status_path(batch_id))
@@ -1528,7 +1586,72 @@ def can_start_batch_run(run_status, uploaded_count):
         return False
     if uploaded_count > 0:
         return True
-    return status in {"failed", "stale", "unknown"}
+    return status in {"failed", "stale", "stopped", "unknown"}
+
+
+def register_batch_process(batch_id, run_id, process):
+    with RUNNING_BATCH_PROCESS_LOCK:
+        RUNNING_BATCH_PROCESSES[batch_id] = {
+            "run_id": run_id,
+            "process": process,
+        }
+
+
+def unregister_batch_process(batch_id, run_id):
+    with RUNNING_BATCH_PROCESS_LOCK:
+        existing = RUNNING_BATCH_PROCESSES.get(batch_id)
+        if existing and existing.get("run_id") == run_id:
+            RUNNING_BATCH_PROCESSES.pop(batch_id, None)
+
+
+def running_batch_process(batch_id, run_id=None):
+    with RUNNING_BATCH_PROCESS_LOCK:
+        existing = RUNNING_BATCH_PROCESSES.get(batch_id)
+        if not existing:
+            return None
+        if run_id and existing.get("run_id") != run_id:
+            return None
+        return existing.get("process")
+
+
+def terminate_batch_process(process):
+    if not process or process.poll() is not None:
+        return False
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except Exception:
+        try:
+            process.terminate()
+        except Exception:
+            return False
+
+    return True
+
+
+def kill_batch_process(process):
+    if not process or process.poll() is not None:
+        return False
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            return False
+
+    return True
+
+
+def force_kill_batch_process_after_timeout(process, timeout=10):
+    if not process:
+        return
+
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_batch_process(process)
 
 
 def write_batch_run_status(batch_id, data, bucket=None):
@@ -1641,6 +1764,7 @@ def run_batch_pipeline(batch_id, run_id):
     started_at = datetime.now(UTC).isoformat()
     progress = initial_run_progress("starting")
     log_lines = []
+    stop_requested = False
 
     def current_log_tail():
         return "".join(log_lines)[-4000:]
@@ -1663,6 +1787,7 @@ def run_batch_pipeline(batch_id, run_id):
 
     try:
         bucket = get_bucket(DEFAULT_GCS_BUCKET)
+        clear_batch_stop_request(batch_id, bucket)
         manifest = read_batch_manifest(batch_id, bucket)
         env["BATCH_TARGET_COLLECTION"] = manifest.get("target_collection", "")
         env["BATCH_LOCATION"] = manifest.get("location", "")
@@ -1676,22 +1801,46 @@ def run_batch_pipeline(batch_id, run_id):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
+            start_new_session=True,
         )
+        register_batch_process(batch_id, run_id, process)
 
         last_status_write = 0
         for line in process.stdout or []:
             log_lines.append(line)
             stage_changed = update_run_progress_from_line(progress, line)
+            if stop_requested_for_run(batch_id, run_id, bucket):
+                stop_requested = True
+                progress["stage"] = "stopping"
+                progress["last_message"] = "Stop requested by operator."
+                log_lines.append("Stop requested by operator.\n")
+                terminate_batch_process(process)
+                write_running_status(bucket)
+                break
+
             now = time.monotonic()
             if stage_changed or now - last_status_write >= 2:
                 write_running_status(bucket)
                 last_status_write = now
 
-        return_code = process.wait()
+        if stop_requested:
+            try:
+                return_code = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                kill_batch_process(process)
+                return_code = process.wait()
+        else:
+            return_code = process.wait()
         log_text = "".join(log_lines)
         upload_batch_run_log(batch_id, log_text, bucket)
+        stop_requested = stop_requested or stop_requested_for_run(batch_id, run_id, bucket)
 
-        if return_code == 0:
+        if stop_requested:
+            status = "stopped"
+            error = "Batch run stopped by operator."
+            progress["stage"] = "stopped"
+            progress["current_file"] = ""
+        elif return_code == 0:
             status = "succeeded"
             error = ""
             progress["stage"] = "complete"
@@ -1732,6 +1881,14 @@ def run_batch_pipeline(batch_id, run_id):
         except Exception:
             pass
     finally:
+        try:
+            unregister_batch_process(batch_id, run_id)
+        except Exception:
+            pass
+        try:
+            clear_batch_stop_request(batch_id)
+        except Exception:
+            pass
         try:
             release_batch_run_lock(batch_id, run_id)
         except Exception:
@@ -1918,6 +2075,61 @@ async def retry_failures(req: Request, batch_id: str, body: RetryFailuresRequest
         "batch": batch_status_payload(batch_id, bucket),
         "failures": batch_failure_rows(batch_id, bucket),
     }
+
+
+@app.post("/batches/{batch_id}/stop")
+async def stop_batch(req: Request, batch_id: str):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(batch_id)
+    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    current_run = normalize_run_status_for_lock(
+        batch_id,
+        read_batch_run_status(batch_id, bucket),
+        bucket,
+    )
+
+    if current_run.get("status") != "running":
+        return batch_status_payload(batch_id, bucket)
+
+    run_id = current_run.get("run_id", "")
+    write_batch_stop_request(batch_id, run_id, bucket)
+    process = running_batch_process(batch_id, run_id)
+    signalled = terminate_batch_process(process)
+    if signalled:
+        threading.Thread(
+            target=force_kill_batch_process_after_timeout,
+            args=(process,),
+            daemon=True,
+        ).start()
+    log_tail = (current_run.get("log_tail") or "").rstrip()
+    if log_tail:
+        log_tail = f"{log_tail}\nStop requested by operator."
+    else:
+        log_tail = "Stop requested by operator."
+
+    status_update = {
+        key: value
+        for key, value in current_run.items()
+        if key not in {"updated_at", "lock_expires_at"}
+    }
+
+    write_batch_run_status(
+        batch_id,
+        {
+            **status_update,
+            "status": "running",
+            "stage": "stopping",
+            "last_message": "Stop requested by operator.",
+            "current_file": "",
+            "error": "",
+            "log_tail": log_tail[-4000:],
+            "stop_signal_sent": signalled,
+        },
+        bucket,
+    )
+
+    return batch_status_payload(batch_id, bucket)
 
 
 @app.post("/batches/{batch_id}/run")

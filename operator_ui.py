@@ -67,6 +67,17 @@ OPERATOR_UI_HTML = """<!doctype html>
       border-color: var(--accent-dark);
     }
 
+    button.danger {
+      background: var(--danger);
+      border-color: var(--danger);
+      color: #ffffff;
+    }
+
+    button.danger:hover {
+      background: #8f1d14;
+      border-color: #8f1d14;
+    }
+
     button:disabled {
       cursor: not-allowed;
       opacity: 0.55;
@@ -763,6 +774,7 @@ OPERATOR_UI_HTML = """<!doctype html>
             <h2>3. Run Files</h2>
             <div class="row">
               <button id="runBatchBtn" type="button" class="primary" disabled>Run Batch</button>
+              <button id="stopBatchBtn" type="button" class="danger" disabled>Stop Run</button>
               <button id="copyCommandBtn" type="button" disabled>Copy Command</button>
               <button id="copyErrorReportBtn" type="button" disabled>Copy Error Report</button>
             </div>
@@ -878,6 +890,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       uploadStatus: el("uploadStatus"),
       fileList: el("fileList"),
       runBatchBtn: el("runBatchBtn"),
+      stopBatchBtn: el("stopBatchBtn"),
       runStatus: el("runStatus"),
       runSteps: el("runSteps"),
       runCommand: el("runCommand"),
@@ -1140,6 +1153,9 @@ OPERATOR_UI_HTML = """<!doctype html>
         nodes.runBatchBtn.disabled = true;
         nodes.runBatchBtn.textContent = "Run Batch";
         nodes.runBatchBtn.title = "";
+        nodes.stopBatchBtn.disabled = true;
+        nodes.stopBatchBtn.textContent = "Stop Run";
+        nodes.stopBatchBtn.title = "";
         nodes.copyCommandBtn.disabled = true;
         nodes.copyErrorReportBtn.disabled = true;
         nodes.refreshVerificationBtn.disabled = true;
@@ -1180,6 +1196,14 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.runBatchBtn.disabled = !data.can_run;
       nodes.runBatchBtn.textContent = runButtonLabel(data);
       nodes.runBatchBtn.title = runButtonTitle(data);
+      const runStatus = data.run?.status || "not_started";
+      const runStage = data.run?.stage || runStatus;
+      const stopping = runStatus === "running" && runStage === "stopping";
+      nodes.stopBatchBtn.disabled = runStatus !== "running" || stopping;
+      nodes.stopBatchBtn.textContent = stopping ? "Stopping..." : "Stop Run";
+      nodes.stopBatchBtn.title = runStatus === "running"
+        ? "Stop the active batch run. Completed files stay recorded; remaining files can be run later."
+        : "Available only while a batch is running.";
       nodes.copyCommandBtn.disabled = !data.run_command;
       nodes.copyErrorReportBtn.disabled = !data.batch_id;
       nodes.refreshVerificationBtn.disabled = false;
@@ -1199,6 +1223,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       const waiting = data?.uploaded_count ?? 0;
 
       if (status === "running") return "Running...";
+      if (status === "stopped") return "Resume Run";
       if (status === "succeeded" && waiting > 0) return "Run New Files";
       if (status === "succeeded") return "Run Complete";
       if (status === "failed" || status === "stale") return "Retry Run";
@@ -1211,6 +1236,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       const waiting = data?.uploaded_count ?? 0;
 
       if (status === "running") return "This batch already has an active run lock.";
+      if (status === "stopped") return "Continue a stopped batch. Already successful files will be skipped.";
       if (status === "succeeded" && waiting < 1) return "This batch has already succeeded and has no new uploads waiting.";
       if (waiting < 1 && !(status === "failed" || status === "stale")) return "Upload files before running the batch.";
       if (status === "failed" || status === "stale") return "Retry the batch. This can retry Airtable import or any remaining waiting files.";
@@ -1243,6 +1269,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         airtable_importer: "Airtable import",
         airtable_summary: "Updating batch summary",
         complete: "Complete",
+        stopping: "Stopping",
+        stopped: "Stopped",
         failed: "Failed",
         stale: "Stale",
         unknown: "Unknown"
@@ -1261,6 +1289,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         airtable_importer: 3,
         airtable_summary: 3,
         complete: 4,
+        stopping: 4,
+        stopped: 4,
         failed: 4,
         stale: 4
       };
@@ -1313,7 +1343,7 @@ OPERATOR_UI_HTML = """<!doctype html>
           className += " error";
         } else if (status === "succeeded" || index < activeIndex) {
           className += " done";
-        } else if (status === "running" && index === activeIndex) {
+        } else if ((status === "running" || status === "stopped") && index === activeIndex) {
           className += " active";
         }
         row.className = className;
@@ -1341,7 +1371,10 @@ OPERATOR_UI_HTML = """<!doctype html>
     function renderRunStatus(run) {
       const status = run?.status || "not_started";
 
-      if (status === "running") {
+      if (status === "running" && run?.stage === "stopping") {
+        setStatus(nodes.runStatus, "Stopping batch run...", "warn");
+        setRunPolling(true);
+      } else if (status === "running") {
         setStatus(nodes.runStatus, `Batch is running: ${runStageLabel(run?.stage)}.`, "warn");
         setRunPolling(true);
       } else if (status === "succeeded") {
@@ -1352,6 +1385,9 @@ OPERATOR_UI_HTML = """<!doctype html>
         setRunPolling(false);
       } else if (status === "stale") {
         setStatus(nodes.runStatus, run?.error || "Previous run looks stale. Retry is available.", "warn");
+        setRunPolling(false);
+      } else if (status === "stopped") {
+        setStatus(nodes.runStatus, run?.error || "Batch run stopped. Run again to continue remaining files.", "warn");
         setRunPolling(false);
       } else {
         setStatus(nodes.runStatus, "Ready to run after files are uploaded.");
@@ -1440,6 +1476,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       const counts = verification.counts || {};
       const runStatus = verification.run_status?.status || "";
       const runIsActive = runStatus === "running";
+      const runWasStopped = runStatus === "stopped";
       nodes.verifyKnownFiles.textContent = String(counts.known_file_rows ?? 0);
       nodes.verifyAirtableItems.textContent = counts.airtable_item_records === null || counts.airtable_item_records === undefined
         ? "?"
@@ -1453,6 +1490,9 @@ OPERATOR_UI_HTML = """<!doctype html>
         if (runIsActive) {
           nodes.verificationQueueNote.textContent =
             `${remaining} file${remaining === 1 ? " is" : "s are"} still queued or processing. Refresh when the run completes.`;
+        } else if (runWasStopped) {
+          nodes.verificationQueueNote.textContent =
+            `${remaining} file${remaining === 1 ? "" : "s"} still waiting after the stopped run. Run the batch again to continue.`;
         } else {
           nodes.verificationQueueNote.textContent =
             `${remaining} file${remaining === 1 ? "" : "s"} still waiting. This usually means the run reached its per-run file limit. Run the batch again to continue.`;
@@ -1733,6 +1773,31 @@ OPERATOR_UI_HTML = """<!doctype html>
         setStatus(nodes.runStatus, error.message, "error");
         nodes.runBatchBtn.disabled = !state.batch?.can_run;
         nodes.runBatchBtn.textContent = runButtonLabel(state.batch);
+      }
+    }
+
+    async function stopBatch() {
+      if (!state.batch?.batch_id) return;
+      const ok = window.confirm("Stop this batch run? Completed files stay recorded and remaining files can be run later.");
+      if (!ok) return;
+
+      saveAccess();
+      setStatus(nodes.runStatus, "Stopping batch run...", "warn");
+      nodes.stopBatchBtn.disabled = true;
+
+      try {
+        const data = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/stop`, {
+          method: "POST",
+          body: JSON.stringify({})
+        });
+        updateBatchView(data);
+        await listBatches(true);
+        if (data.run?.status !== "running") {
+          await loadVerification(true);
+        }
+      } catch (error) {
+        setStatus(nodes.runStatus, error.message, "error");
+        nodes.stopBatchBtn.disabled = state.batch?.run?.status !== "running";
       }
     }
 
@@ -2045,6 +2110,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.loadBatchBtn.addEventListener("click", () => loadBatch(nodes.existingBatchInput.value));
       nodes.listBatchesBtn.addEventListener("click", () => listBatches());
       nodes.runBatchBtn.addEventListener("click", runBatch);
+      nodes.stopBatchBtn.addEventListener("click", stopBatch);
       nodes.refreshVerificationBtn.addEventListener("click", () => loadVerification());
       nodes.refreshFailuresBtn.addEventListener("click", () => loadFailures());
       nodes.retryFailuresBtn.addEventListener("click", retryFailures);

@@ -38,6 +38,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 
 - Done: add `run_import_pipeline.py` as the single operator command/job that runs batch processing and Airtable import in sequence.
 - Done: add a UI `Run Batch` action that starts the pipeline and polls durable run status.
+- Done: add an operator stop control for active batch runs, with stopped batches restartable later.
 - Done: disable completed batch reruns unless there are new files waiting, while still allowing retry after failed/stale runs.
 - Keep the current UI-run approach for small operator batches while the system is still Airtable-backed.
 - Later: move batch execution to a dedicated Render worker/job queue before relying on very large production batches.
@@ -47,6 +48,16 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 - Add clearer environment documentation for Render jobs and local runs.
 - Shorten and sanitize failure messages before writing them to Airtable, especially errors containing signed URLs.
 - Done: add lightweight tests for path cleaning, duplicate detection, retry behavior, and Airtable path handling.
+
+## Performance / Scale
+
+- Profile 50, 250, and 500 file runs so slow stages are measured rather than guessed.
+- Tune `SLEEP_SECONDS` downward once extractor/OpenAI/Airtable rate limits are understood.
+- Add configurable extraction concurrency so multiple files can be OCR/LLM processed in parallel with safe retry/backoff.
+- Batch Airtable create/update calls where safe, respecting Airtable's API limits.
+- Avoid full Airtable table scans on every import by using targeted lookups or a local per-run cache.
+- Move long-running batch execution to a dedicated worker/job queue before relying on 500+ file production batches.
+- Consider image preprocessing options, such as resizing very large uploads, if OCR quality remains stable.
 
 ## Supabase / Future App
 
