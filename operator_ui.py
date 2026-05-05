@@ -73,7 +73,8 @@ OPERATOR_UI_HTML = """<!doctype html>
     }
 
     input,
-    textarea {
+    textarea,
+    select {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -585,20 +586,20 @@ OPERATOR_UI_HTML = """<!doctype html>
             </label>
             <label>
               Target collection
+              <select id="collectionSelect"></select>
+            </label>
               <div class="lookup-row">
-                <input id="collectionInput" type="text" list="collectionOptions" placeholder="Optional">
+                <input id="collectionNewInput" type="text" placeholder="New collection">
                 <button id="addCollectionBtn" type="button">Add</button>
               </div>
-            </label>
             <label>
               Location
+              <select id="locationSelect"></select>
+            </label>
               <div class="lookup-row">
-                <input id="locationInput" type="text" list="locationOptions" placeholder="Optional">
+                <input id="locationNewInput" type="text" placeholder="New location">
                 <button id="addLocationBtn" type="button">Add</button>
               </div>
-            </label>
-            <datalist id="collectionOptions"></datalist>
-            <datalist id="locationOptions"></datalist>
             <label>
               Notes
               <textarea id="notesInput" placeholder="Optional"></textarea>
@@ -755,11 +756,11 @@ OPERATOR_UI_HTML = """<!doctype html>
       clearAccessBtn: el("clearAccessBtn"),
       accessStatus: el("accessStatus"),
       sourceInput: el("sourceInput"),
-      collectionInput: el("collectionInput"),
-      collectionOptions: el("collectionOptions"),
+      collectionSelect: el("collectionSelect"),
+      collectionNewInput: el("collectionNewInput"),
       addCollectionBtn: el("addCollectionBtn"),
-      locationInput: el("locationInput"),
-      locationOptions: el("locationOptions"),
+      locationSelect: el("locationSelect"),
+      locationNewInput: el("locationNewInput"),
       addLocationBtn: el("addLocationBtn"),
       notesInput: el("notesInput"),
       createBatchBtn: el("createBatchBtn"),
@@ -860,6 +861,21 @@ OPERATOR_UI_HTML = """<!doctype html>
       renderBatchList();
     }
 
+    function lookupNodes(kind) {
+      if (kind === "collections") {
+        return {
+          select: nodes.collectionSelect,
+          input: nodes.collectionNewInput,
+          emptyLabel: "No collection"
+        };
+      }
+      return {
+        select: nodes.locationSelect,
+        input: nodes.locationNewInput,
+        emptyLabel: "No location"
+      };
+    }
+
     async function checkApi() {
       saveAccess();
       try {
@@ -873,21 +889,56 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
     }
 
+    function appendLookupOption(select, value, label) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      select.appendChild(option);
+    }
+
+    function selectHasValue(select, value) {
+      return Array.from(select.options).some((option) => option.value === value);
+    }
+
+    function renderLookupSelect(kind) {
+      const { select, emptyLabel } = lookupNodes(kind);
+      const currentValue = select.value;
+      const options = state.lookupOptions[kind] || [];
+
+      select.innerHTML = "";
+      appendLookupOption(select, "", emptyLabel);
+
+      for (const option of options) {
+        appendLookupOption(select, option.name, option.name);
+      }
+
+      if (currentValue && !options.some((option) => option.name === currentValue)) {
+        appendLookupOption(select, currentValue, currentValue);
+      }
+
+      select.value = currentValue || "";
+    }
+
     function renderLookupOptions() {
-      nodes.collectionOptions.innerHTML = "";
-      nodes.locationOptions.innerHTML = "";
+      renderLookupSelect("collections");
+      renderLookupSelect("locations");
+    }
 
-      for (const option of state.lookupOptions.collections || []) {
-        const item = document.createElement("option");
-        item.value = option.name;
-        nodes.collectionOptions.appendChild(item);
-      }
+    function setLookupValue(kind, value) {
+      const { select, input } = lookupNodes(kind);
+      const options = state.lookupOptions[kind] || [];
+      value = (value || "").trim();
 
-      for (const option of state.lookupOptions.locations || []) {
-        const item = document.createElement("option");
-        item.value = option.name;
-        nodes.locationOptions.appendChild(item);
+      input.value = "";
+      if (value && !options.some((option) => option.name === value) && !selectHasValue(select, value)) {
+        appendLookupOption(select, value, value);
       }
+      select.value = value;
+    }
+
+    function selectedLookupValue(kind) {
+      const { select, input } = lookupNodes(kind);
+      return (input.value.trim() || select.value.trim());
     }
 
     async function loadLookupOptions(quiet = false) {
@@ -912,7 +963,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     async function addLookupOption(kind) {
       saveAccess();
-      const input = kind === "collections" ? nodes.collectionInput : nodes.locationInput;
+      const { input } = lookupNodes(kind);
       const label = kind === "collections" ? "collection" : "location";
       const value = input.value.trim();
 
@@ -931,10 +982,10 @@ OPERATOR_UI_HTML = """<!doctype html>
           body: JSON.stringify({ name: value })
         });
         await loadLookupOptions(true);
-        input.value = data.name || value;
+        setLookupValue(kind, data.name || value);
         setStatus(
           nodes.batchStatus,
-          `${data.created ? "Added" : "Found existing"} ${label}: ${input.value}.`,
+          `${data.created ? "Added" : "Found existing"} ${label}: ${data.name || value}.`,
           "ok"
         );
       } catch (error) {
@@ -974,8 +1025,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         sessionStorage.setItem("rb_batch_id", state.batchId);
         nodes.existingBatchInput.value = state.batchId;
       }
-      nodes.collectionInput.value = data.target_collection || "";
-      nodes.locationInput.value = data.location || "";
+      setLookupValue("collections", data.target_collection || "");
+      setLookupValue("locations", data.location || "");
       nodes.batchId.textContent = data.batch_id || "None";
       nodes.bucketName.textContent = data.bucket || "None";
       nodes.inputPrefix.textContent = data.input_prefix || "None";
@@ -1387,8 +1438,8 @@ OPERATOR_UI_HTML = """<!doctype html>
           method: "POST",
           body: JSON.stringify({
             source: nodes.sourceInput.value.trim(),
-            target_collection: nodes.collectionInput.value.trim(),
-            location: nodes.locationInput.value.trim(),
+            target_collection: selectedLookupValue("collections"),
+            location: selectedLookupValue("locations"),
             notes: nodes.notesInput.value.trim()
           })
         });
