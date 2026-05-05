@@ -45,6 +45,8 @@ MAX_FAILURE_IMPORT_ROWS = int(os.getenv("MAX_FAILURE_IMPORT_ROWS", str(MAX_IMPOR
 batch_record_cache = {}
 lookup_record_cache = {}
 batch_manifest_cache = None
+resolved_item_collection_link_field = AIRTABLE_ITEM_COLLECTION_LINK_FIELD
+resolved_item_location_link_field = AIRTABLE_ITEM_LOCATION_LINK_FIELD
 
 try:
     import_timezone = ZoneInfo(IMPORT_TIMEZONE)
@@ -376,6 +378,9 @@ def update_airtable_record(table_name, record_id, fields):
 
 
 def validate_required_airtable_fields():
+    global resolved_item_collection_link_field
+    global resolved_item_location_link_field
+
     response = requests.get(
         airtable_meta_url(),
         headers=airtable_headers(),
@@ -391,11 +396,50 @@ def validate_required_airtable_fields():
 
     tables = response.json().get("tables", [])
 
-    def table_fields(table_name):
+    def table_by_name(table_name):
         for table in tables:
             if table.get("name") == table_name:
-                return {field.get("name") for field in table.get("fields", [])}
+                return table
         raise RuntimeError(f"Airtable table not found: {table_name}")
+
+    def table_fields(table_name):
+        return {field.get("name") for field in table_by_name(table_name).get("fields", [])}
+
+    def resolve_link_field(configured_field, linked_table_name, fallback_names):
+        if not configured_field:
+            return ""
+
+        items_table = table_by_name(AIRTABLE_TABLE_NAME)
+        linked_table = table_by_name(linked_table_name)
+        linked_table_id = linked_table.get("id")
+        link_fields = []
+
+        for field in items_table.get("fields", []):
+            field_name = field.get("name", "")
+            if field.get("type") != "multipleRecordLinks":
+                continue
+            if field.get("options", {}).get("linkedTableId") == linked_table_id:
+                link_fields.append(field_name)
+
+        if configured_field in link_fields:
+            return configured_field
+
+        for fallback_name in fallback_names:
+            if fallback_name in link_fields:
+                print(
+                    f"Using Airtable linked field {AIRTABLE_TABLE_NAME} -> "
+                    f"{fallback_name} instead of configured {configured_field}"
+                )
+                return fallback_name
+
+        if len(link_fields) == 1:
+            print(
+                f"Using only Airtable link to {linked_table_name}: "
+                f"{AIRTABLE_TABLE_NAME} -> {link_fields[0]}"
+            )
+            return link_fields[0]
+
+        return ""
 
     items_fields = table_fields(AIRTABLE_TABLE_NAME)
     missing = []
@@ -405,16 +449,42 @@ def validate_required_airtable_fields():
 
     collection_name = batch_metadata_value("target_collection", BATCH_TARGET_COLLECTION)
     if collection_name and AIRTABLE_ITEM_COLLECTION_LINK_FIELD:
-        if AIRTABLE_ITEM_COLLECTION_LINK_FIELD not in items_fields:
-            missing.append(f"{AIRTABLE_TABLE_NAME} -> {AIRTABLE_ITEM_COLLECTION_LINK_FIELD}")
+        resolved_item_collection_link_field = resolve_link_field(
+            AIRTABLE_ITEM_COLLECTION_LINK_FIELD,
+            AIRTABLE_COLLECTIONS_TABLE_NAME,
+            [
+                "Collection (linked)",
+                "Collection linked",
+                "Collections",
+                "Collection",
+            ],
+        )
+        if not resolved_item_collection_link_field:
+            missing.append(
+                f"{AIRTABLE_TABLE_NAME} -> link to {AIRTABLE_COLLECTIONS_TABLE_NAME} "
+                f"(configured as {AIRTABLE_ITEM_COLLECTION_LINK_FIELD})"
+            )
         collection_fields = table_fields(AIRTABLE_COLLECTIONS_TABLE_NAME)
         if AIRTABLE_COLLECTION_NAME_FIELD not in collection_fields:
             missing.append(f"{AIRTABLE_COLLECTIONS_TABLE_NAME} -> {AIRTABLE_COLLECTION_NAME_FIELD}")
 
     location_name = batch_metadata_value("location", BATCH_LOCATION)
     if location_name and AIRTABLE_ITEM_LOCATION_LINK_FIELD:
-        if AIRTABLE_ITEM_LOCATION_LINK_FIELD not in items_fields:
-            missing.append(f"{AIRTABLE_TABLE_NAME} -> {AIRTABLE_ITEM_LOCATION_LINK_FIELD}")
+        resolved_item_location_link_field = resolve_link_field(
+            AIRTABLE_ITEM_LOCATION_LINK_FIELD,
+            AIRTABLE_LOCATIONS_TABLE_NAME,
+            [
+                "Location",
+                "Location (linked)",
+                "Location linked",
+                "Locations",
+            ],
+        )
+        if not resolved_item_location_link_field:
+            missing.append(
+                f"{AIRTABLE_TABLE_NAME} -> link to {AIRTABLE_LOCATIONS_TABLE_NAME} "
+                f"(configured as {AIRTABLE_ITEM_LOCATION_LINK_FIELD})"
+            )
         location_fields = table_fields(AIRTABLE_LOCATIONS_TABLE_NAME)
         if AIRTABLE_LOCATION_NAME_FIELD not in location_fields:
             missing.append(f"{AIRTABLE_LOCATIONS_TABLE_NAME} -> {AIRTABLE_LOCATION_NAME_FIELD}")
@@ -615,10 +685,10 @@ def create_airtable_record(row):
 
     if batch_record_id:
         fields[AIRTABLE_ITEM_BATCH_LINK_FIELD] = [batch_record_id]
-    if collection_record_id and AIRTABLE_ITEM_COLLECTION_LINK_FIELD:
-        fields[AIRTABLE_ITEM_COLLECTION_LINK_FIELD] = [collection_record_id]
-    if location_record_id and AIRTABLE_ITEM_LOCATION_LINK_FIELD:
-        fields[AIRTABLE_ITEM_LOCATION_LINK_FIELD] = [location_record_id]
+    if collection_record_id and resolved_item_collection_link_field:
+        fields[resolved_item_collection_link_field] = [collection_record_id]
+    if location_record_id and resolved_item_location_link_field:
+        fields[resolved_item_location_link_field] = [location_record_id]
 
     fields = {k: v for k, v in fields.items() if v not in [None, ""]}
 

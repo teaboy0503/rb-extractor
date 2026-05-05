@@ -60,6 +60,11 @@ Use this after deploys that touch upload, processing, import, Airtable links, or
 - **Missing collection/location links**: confirm the `AIRTABLE_ITEM_COLLECTION_LINK_FIELD` and `AIRTABLE_ITEM_LOCATION_LINK_FIELD` env vars match Airtable exactly.
 - **Airtable verification warning**: usually an Airtable field name/env var mismatch or missing token permission.
 
+## Reporting Errors
+
+Use **Copy Error Report** in `/operator` after a failed run. It copies the batch
+ID, verification checks, and full saved run log into one clipboard payload.
+
 ## Important Env Vars
 
 ```text

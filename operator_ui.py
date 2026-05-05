@@ -758,6 +758,7 @@ OPERATOR_UI_HTML = """<!doctype html>
             <div class="row">
               <button id="runBatchBtn" type="button" class="primary" disabled>Run Batch</button>
               <button id="copyCommandBtn" type="button" disabled>Copy Command</button>
+              <button id="copyErrorReportBtn" type="button" disabled>Copy Error Report</button>
             </div>
           </div>
           <div id="runStatus" class="status-line"></div>
@@ -874,6 +875,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       runCommand: el("runCommand"),
       runLog: el("runLog"),
       copyCommandBtn: el("copyCommandBtn"),
+      copyErrorReportBtn: el("copyErrorReportBtn"),
       refreshVerificationBtn: el("refreshVerificationBtn"),
       verificationStatus: el("verificationStatus"),
       verificationList: el("verificationList"),
@@ -1130,6 +1132,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         nodes.runBatchBtn.textContent = "Run Batch";
         nodes.runBatchBtn.title = "";
         nodes.copyCommandBtn.disabled = true;
+        nodes.copyErrorReportBtn.disabled = true;
         nodes.refreshVerificationBtn.disabled = true;
         nodes.refreshFailuresBtn.disabled = true;
         state.verification = null;
@@ -1162,6 +1165,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.runBatchBtn.textContent = runButtonLabel(data);
       nodes.runBatchBtn.title = runButtonTitle(data);
       nodes.copyCommandBtn.disabled = !data.run_command;
+      nodes.copyErrorReportBtn.disabled = !data.batch_id;
       nodes.refreshVerificationBtn.disabled = false;
       nodes.refreshFailuresBtn.disabled = false;
       renderRunStatus(data.run);
@@ -1910,6 +1914,54 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
     }
 
+    function errorReportFromData(logData) {
+      const batch = state.batch || {};
+      const verification = state.verification;
+      const checks = verification?.checks || [];
+      const checkLines = checks.length
+        ? checks.map((check) => `- [${(check.status || "info").toUpperCase()}] ${check.label}: ${check.detail || ""}`).join("\\n")
+        : "- No verification data loaded.";
+
+      return [
+        "RB Extractor error report",
+        `Batch ID: ${batch.batch_id || ""}`,
+        `Run status: ${batch.run?.status || ""}`,
+        `Run stage: ${batch.run?.stage || ""}`,
+        `Results path: gs://${batch.bucket || ""}/${batch.results_path || ""}`,
+        `Input prefix: ${batch.input_prefix || ""}`,
+        `Collection: ${batch.target_collection || ""}`,
+        `Location: ${batch.location || ""}`,
+        `Verification status: ${verification?.overall_status || ""}`,
+        "",
+        "Verification checks:",
+        checkLines,
+        "",
+        `Log path: ${logData.log_path || batch.run?.log_path || ""}`,
+        "",
+        "Run log:",
+        logData.log_text || batch.run?.log_tail || nodes.runLog.textContent || ""
+      ].join("\\n");
+    }
+
+    async function copyErrorReport() {
+      if (!state.batch?.batch_id) return;
+      saveAccess();
+      nodes.copyErrorReportBtn.disabled = true;
+
+      try {
+        if (!state.verification) {
+          await loadVerification(true);
+        }
+        const logData = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/log`);
+        await navigator.clipboard.writeText(errorReportFromData(logData));
+        setStatus(nodes.runStatus, "Error report copied.", "ok");
+      } catch (error) {
+        setStatus(nodes.runStatus, `Could not copy error report: ${error.message}`, "error");
+      } finally {
+        nodes.copyErrorReportBtn.disabled = !state.batch?.batch_id;
+      }
+    }
+
     function init() {
       nodes.apiToken.value = state.token;
       nodes.apiBase.value = state.apiBase;
@@ -1943,6 +1995,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         updateUploadButtons();
       });
       nodes.copyCommandBtn.addEventListener("click", copyCommand);
+      nodes.copyErrorReportBtn.addEventListener("click", copyErrorReport);
 
       window.addEventListener("beforeunload", (event) => {
         if (!state.uploadInProgress) return;

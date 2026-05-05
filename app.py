@@ -49,7 +49,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.2-legacy-collection-options"
+APP_VERSION = "1.13.3-error-report"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -1375,6 +1375,17 @@ def upload_batch_run_log(batch_id, log_text, bucket=None):
     )
 
 
+def read_batch_log_text(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    blob = bucket.blob(batch_run_log_path(batch_id))
+
+    if blob.exists():
+        return blob.download_as_text(encoding="utf-8")
+
+    status = read_batch_run_status(batch_id, bucket)
+    return status.get("log_tail") or ""
+
+
 def initial_run_progress(stage="queued"):
     return {
         "stage": stage,
@@ -1689,6 +1700,20 @@ async def get_batch_verification(req: Request, batch_id: str):
 
     batch_id = validate_batch_id(batch_id)
     return batch_verification_payload(batch_id)
+
+
+@app.get("/batches/{batch_id}/log")
+async def get_batch_log(req: Request, batch_id: str):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(batch_id)
+    log_text = read_batch_log_text(batch_id)
+
+    return {
+        "batch_id": batch_id,
+        "log_path": batch_run_log_path(batch_id),
+        "log_text": log_text,
+    }
 
 
 @app.post("/batches/{batch_id}/retry-failures")

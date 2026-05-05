@@ -100,6 +100,13 @@ curl "$EXTRACTOR_URL/batches/{batch_id}/verification" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
+Fetch a batch run log:
+
+```bash
+curl "$EXTRACTOR_URL/batches/{batch_id}/log" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
 List recent operator batches:
 
 ```bash
