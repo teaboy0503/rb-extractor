@@ -820,6 +820,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         nodes.runCommand.textContent = "Create a batch to generate the command.";
         nodes.refreshBatchBtn.disabled = true;
         nodes.runBatchBtn.disabled = true;
+        nodes.runBatchBtn.textContent = "Run Batch";
+        nodes.runBatchBtn.title = "";
         nodes.copyCommandBtn.disabled = true;
         renderRunStatus(null);
         return;
@@ -841,11 +843,37 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.resultFailed.textContent = String(data.results?.failed ?? 0);
       nodes.runCommand.textContent = data.run_command || "No command available.";
       nodes.refreshBatchBtn.disabled = false;
-      nodes.runBatchBtn.disabled = !data.batch_id || data.run?.status === "running" || (data.uploaded_count ?? 0) < 1;
+      nodes.runBatchBtn.disabled = !data.can_run;
+      nodes.runBatchBtn.textContent = runButtonLabel(data);
+      nodes.runBatchBtn.title = runButtonTitle(data);
       nodes.copyCommandBtn.disabled = !data.run_command;
       renderRunStatus(data.run);
       updateUploadButtons();
       renderBatchList();
+    }
+
+    function runButtonLabel(data) {
+      const status = data?.run?.status || "not_started";
+      const waiting = data?.uploaded_count ?? 0;
+
+      if (status === "running") return "Running...";
+      if (status === "succeeded" && waiting > 0) return "Run New Files";
+      if (status === "succeeded") return "Run Complete";
+      if (status === "failed" || status === "stale") return "Retry Run";
+      if (waiting < 1) return "No Files Waiting";
+      return "Run Batch";
+    }
+
+    function runButtonTitle(data) {
+      const status = data?.run?.status || "not_started";
+      const waiting = data?.uploaded_count ?? 0;
+
+      if (status === "running") return "This batch already has an active run lock.";
+      if (status === "succeeded" && waiting < 1) return "This batch has already succeeded and has no new uploads waiting.";
+      if (waiting < 1 && !(status === "failed" || status === "stale")) return "Upload files before running the batch.";
+      if (status === "failed" || status === "stale") return "Retry the batch. This can retry Airtable import or any remaining waiting files.";
+      if (status === "succeeded" && waiting > 0) return "Run only the newly uploaded files waiting in this batch.";
+      return "Start the end-to-end import for this batch.";
     }
 
     function setRunPolling(active) {
@@ -873,6 +901,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         airtable_summary: "Updating batch summary",
         complete: "Complete",
         failed: "Failed",
+        stale: "Stale",
         unknown: "Unknown"
       };
       return labels[stage] || labels.unknown;
@@ -889,7 +918,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         airtable_importer: 3,
         airtable_summary: 3,
         complete: 4,
-        failed: 4
+        failed: 4,
+        stale: 4
       };
       return indexes[stage] ?? 0;
     }
@@ -936,7 +966,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       for (const [index, step] of steps.entries()) {
         const row = document.createElement("div");
         let className = "step-row";
-        if (status === "failed" && index === activeIndex) {
+        if ((status === "failed" || status === "stale") && index === activeIndex) {
           className += " error";
         } else if (status === "succeeded" || index < activeIndex) {
           className += " done";
@@ -976,6 +1006,9 @@ OPERATOR_UI_HTML = """<!doctype html>
         setRunPolling(false);
       } else if (status === "failed") {
         setStatus(nodes.runStatus, run?.error || "Batch run failed.", "error");
+        setRunPolling(false);
+      } else if (status === "stale") {
+        setStatus(nodes.runStatus, run?.error || "Previous run looks stale. Retry is available.", "warn");
         setRunPolling(false);
       } else {
         setStatus(nodes.runStatus, "Ready to run after files are uploaded.");
@@ -1142,7 +1175,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         await listBatches(true);
       } catch (error) {
         setStatus(nodes.runStatus, error.message, "error");
-        nodes.runBatchBtn.disabled = !state.batch?.batch_id || (state.batch?.uploaded_count ?? 0) < 1;
+        nodes.runBatchBtn.disabled = !state.batch?.can_run;
+        nodes.runBatchBtn.textContent = runButtonLabel(state.batch);
       }
     }
 

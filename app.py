@@ -8,8 +8,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 
+from google.api_core.exceptions import NotFound, PreconditionFailed
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -32,7 +34,8 @@ MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
 SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUTES", "60"))
-APP_VERSION = "1.10.0-operator-progress"
+BATCH_RUN_LOCK_TTL_SECONDS = int(os.getenv("BATCH_RUN_LOCK_TTL_SECONDS", "21600"))
+APP_VERSION = "1.11.0-operator-locks"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -122,6 +125,10 @@ def batch_run_status_path(batch_id):
 
 def batch_run_log_path(batch_id):
     return f"{batch_root_prefix(batch_id)}run.log"
+
+
+def batch_run_lock_path(batch_id):
+    return f"{batch_root_prefix(batch_id)}run.lock.json"
 
 
 def batch_run_command(batch_id):
@@ -387,13 +394,19 @@ def batch_results_counts(batch_id, bucket=None):
 def batch_status_payload(batch_id, bucket=None):
     bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
     manifest = read_batch_manifest(batch_id, bucket)
+    uploaded_count = count_batch_uploads(batch_id, bucket)
+    run_status = normalize_run_status_for_lock(
+        batch_id,
+        read_batch_run_status(batch_id, bucket),
+        bucket,
+    )
 
     return {
         "batch_id": batch_id,
         "bucket": manifest.get("bucket") or DEFAULT_GCS_BUCKET,
         "input_prefix": manifest.get("input_prefix") or batch_input_prefix(batch_id),
         "results_path": manifest.get("results_path") or batch_results_path(batch_id),
-        "uploaded_count": count_batch_uploads(batch_id, bucket),
+        "uploaded_count": uploaded_count,
         "results": batch_results_counts(batch_id, bucket),
         "run_command": manifest.get("run_command") or batch_run_command(batch_id),
         "source": manifest.get("source", ""),
@@ -401,7 +414,8 @@ def batch_status_payload(batch_id, bucket=None):
         "location": manifest.get("location", ""),
         "notes": manifest.get("notes", ""),
         "created_at": manifest.get("created_at", ""),
-        "run": read_batch_run_status(batch_id, bucket),
+        "run": run_status,
+        "can_run": can_start_batch_run(run_status, uploaded_count),
     }
 
 
@@ -425,6 +439,89 @@ def list_operator_batch_ids(bucket):
     return sorted(batch_ids, reverse=True)
 
 
+def parse_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def read_batch_run_lock(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    blob = bucket.blob(batch_run_lock_path(batch_id))
+
+    try:
+        blob.reload()
+    except NotFound:
+        return None
+
+    try:
+        data = json.loads(blob.download_as_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        data = {}
+
+    expires_at = parse_datetime(data.get("expires_at"))
+    data["generation"] = blob.generation
+    data["expired"] = bool(expires_at and expires_at <= datetime.now(UTC))
+    return data
+
+
+def acquire_batch_run_lock(batch_id, run_id, bucket=None, force=False):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    lock_blob = bucket.blob(batch_run_lock_path(batch_id))
+
+    for _ in range(2):
+        existing = read_batch_run_lock(batch_id, bucket)
+        if existing:
+            if not (force or existing.get("expired")):
+                return None, existing
+
+            try:
+                lock_blob.delete(if_generation_match=int(existing["generation"]))
+            except (NotFound, PreconditionFailed):
+                continue
+
+        now = datetime.now(UTC)
+        payload = {
+            "batch_id": batch_id,
+            "run_id": run_id,
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=BATCH_RUN_LOCK_TTL_SECONDS)).isoformat(),
+        }
+
+        try:
+            lock_blob.upload_from_string(
+                json.dumps(payload, indent=2),
+                content_type="application/json",
+                if_generation_match=0,
+            )
+            lock_blob.reload()
+            payload["generation"] = lock_blob.generation
+            payload["expired"] = False
+            return payload, None
+        except PreconditionFailed:
+            continue
+
+    return None, read_batch_run_lock(batch_id, bucket)
+
+
+def release_batch_run_lock(batch_id, run_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    existing = read_batch_run_lock(batch_id, bucket)
+
+    if not existing or existing.get("run_id") != run_id:
+        return
+
+    try:
+        bucket.blob(batch_run_lock_path(batch_id)).delete(
+            if_generation_match=int(existing["generation"])
+        )
+    except (NotFound, PreconditionFailed):
+        pass
+
+
 def read_batch_run_status(batch_id, bucket=None):
     bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
     blob = bucket.blob(batch_run_status_path(batch_id))
@@ -445,6 +542,41 @@ def read_batch_run_status(batch_id, bucket=None):
             "error": "Run status file could not be parsed.",
             **initial_run_progress("unknown"),
         }
+
+
+def normalize_run_status_for_lock(batch_id, run_status, bucket=None):
+    if run_status.get("status") != "running":
+        return run_status
+
+    lock = read_batch_run_lock(batch_id, bucket)
+    if not lock:
+        return {
+            **run_status,
+            "status": "stale",
+            "error": "No active run lock found. The previous run may have stopped.",
+        }
+
+    if lock.get("expired"):
+        return {
+            **run_status,
+            "status": "stale",
+            "error": "Run lock expired. The previous run may have stopped.",
+            "lock_expires_at": lock.get("expires_at", ""),
+        }
+
+    return {
+        **run_status,
+        "lock_expires_at": lock.get("expires_at", ""),
+    }
+
+
+def can_start_batch_run(run_status, uploaded_count):
+    status = run_status.get("status")
+    if status == "running":
+        return False
+    if uploaded_count > 0:
+        return True
+    return status in {"failed", "stale", "unknown"}
 
 
 def write_batch_run_status(batch_id, data, bucket=None):
@@ -536,7 +668,7 @@ def update_run_progress_from_line(progress, line):
     return progress.get("stage") != previous_stage
 
 
-def run_batch_pipeline(batch_id):
+def run_batch_pipeline(batch_id, run_id):
     repo_dir = os.path.dirname(os.path.abspath(__file__))
     env = os.environ.copy()
     env["IMPORT_BATCH_ID"] = batch_id
@@ -555,6 +687,7 @@ def run_batch_pipeline(batch_id):
             batch_id,
             {
                 "status": "running",
+                "run_id": run_id,
                 "started_at": started_at,
                 "finished_at": "",
                 "return_code": "",
@@ -604,6 +737,7 @@ def run_batch_pipeline(batch_id):
             batch_id,
             {
                 "status": status,
+                "run_id": run_id,
                 "started_at": started_at,
                 "finished_at": datetime.now(UTC).isoformat(),
                 "return_code": return_code,
@@ -620,6 +754,7 @@ def run_batch_pipeline(batch_id):
                 batch_id,
                 {
                     "status": "failed",
+                    "run_id": run_id,
                     "started_at": started_at,
                     "finished_at": datetime.now(UTC).isoformat(),
                     "return_code": "",
@@ -628,6 +763,11 @@ def run_batch_pipeline(batch_id):
                     **progress,
                 },
             )
+        except Exception:
+            pass
+    finally:
+        try:
+            release_batch_run_lock(batch_id, run_id)
         except Exception:
             pass
 
@@ -723,18 +863,36 @@ async def run_batch(req: Request, batch_id: str, body: RunBatchRequest | None = 
     batch_id = validate_batch_id(batch_id)
     body = body or RunBatchRequest()
     bucket = get_bucket(DEFAULT_GCS_BUCKET)
-    current_run = read_batch_run_status(batch_id, bucket)
+    current_run = normalize_run_status_for_lock(
+        batch_id,
+        read_batch_run_status(batch_id, bucket),
+        bucket,
+    )
+    uploaded_count = count_batch_uploads(batch_id, bucket)
 
-    if current_run.get("status") == "running" and not body.force:
-        raise HTTPException(status_code=409, detail="Batch is already running")
-
-    if count_batch_uploads(batch_id, bucket) < 1 and not body.force:
+    if not can_start_batch_run(current_run, uploaded_count) and not body.force:
+        if current_run.get("status") == "running":
+            raise HTTPException(status_code=409, detail="Batch is already running")
+        if current_run.get("status") == "succeeded":
+            raise HTTPException(
+                status_code=409,
+                detail="Batch already succeeded and has no new files waiting",
+            )
         raise HTTPException(status_code=400, detail="No files are waiting in this batch")
+
+    run_id = f"run-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    lock, existing_lock = acquire_batch_run_lock(batch_id, run_id, bucket, force=body.force)
+    if not lock:
+        detail = "Batch is already running"
+        if existing_lock and existing_lock.get("expires_at"):
+            detail = f"Batch is already running until {existing_lock['expires_at']}"
+        raise HTTPException(status_code=409, detail=detail)
 
     write_batch_run_status(
         batch_id,
         {
             "status": "running",
+            "run_id": run_id,
             "started_at": datetime.now(UTC).isoformat(),
             "finished_at": "",
             "return_code": "",
@@ -745,7 +903,7 @@ async def run_batch(req: Request, batch_id: str, body: RunBatchRequest | None = 
         bucket,
     )
 
-    thread = threading.Thread(target=run_batch_pipeline, args=(batch_id,), daemon=True)
+    thread = threading.Thread(target=run_batch_pipeline, args=(batch_id, run_id), daemon=True)
     thread.start()
 
     return batch_status_payload(batch_id, bucket)

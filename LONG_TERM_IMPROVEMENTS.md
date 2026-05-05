@@ -7,7 +7,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 - Done: use the end-to-end runner to write per-batch result files at `results/batches/{import_batch_id}.csv`, so the importer does not scan one forever-growing `batch_results.csv`.
 - Keep the existing legacy `results/batch_results.csv` for backward compatibility until the per-batch importer is proven.
 - Add a durable per-file state model: uploaded, queued, extracting, extracted, imported, failed, resolved.
-- Add per-batch run locking/idempotency so repeated clicks or duplicate jobs cannot process the same batch at the same time.
+- Done: add per-batch run locking/idempotency so repeated clicks or duplicate jobs cannot process the same batch at the same time.
 - Avoid moving source images before result/checkpoint writes are durable.
 - Preserve relative source paths or add collision-resistant destination names so duplicate filenames cannot overwrite each other.
 - Done: reject extractor successes with very short OCR text so blank records become import failures instead.
@@ -36,6 +36,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 
 - Done: add `run_import_pipeline.py` as the single operator command/job that runs batch processing and Airtable import in sequence.
 - Done: add a UI `Run Batch` action that starts the pipeline and polls durable run status.
+- Done: disable completed batch reruns unless there are new files waiting, while still allowing retry after failed/stale runs.
 - Keep the current UI-run approach for small operator batches while the system is still Airtable-backed.
 - Later: move batch execution to a dedicated Render worker/job queue before relying on very large production batches.
 - Add a clearer operator status page: queued/running/succeeded/failed, run duration, imported count, failed count, and latest log tail.
