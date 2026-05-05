@@ -50,7 +50,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.14-batch-aware-panels"
+APP_VERSION = "1.13.15-local-batch-extractor"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -589,6 +589,18 @@ def batch_run_command(batch_id):
         f"BATCH_RESULTS_PATH={results_path} "
         "python3 run_import_pipeline.py"
     )
+
+
+def local_extractor_url():
+    port = os.getenv("PORT", "").strip()
+    if not port:
+        return ""
+    return f"http://127.0.0.1:{port}/extract"
+
+
+def should_use_local_batch_extractor():
+    value = os.getenv("BATCH_USE_LOCAL_EXTRACTOR", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def safe_filename(filename):
@@ -1777,6 +1789,9 @@ def run_batch_pipeline(batch_id, run_id):
     env["BATCH_INPUT_PREFIX"] = batch_input_prefix(batch_id)
     env["BATCH_RESULTS_PATH"] = batch_results_path(batch_id)
     env["PYTHONUNBUFFERED"] = "1"
+    local_url = os.getenv("BATCH_LOCAL_EXTRACTOR_URL", "").strip() or local_extractor_url()
+    if local_url and should_use_local_batch_extractor():
+        env["EXTRACTOR_URL"] = local_url
     started_at = datetime.now(UTC).isoformat()
     progress = initial_run_progress("starting")
     log_lines = []

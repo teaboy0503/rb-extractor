@@ -308,6 +308,17 @@ class LookupOptionsTests(unittest.TestCase):
 
 
 class BatchVerificationTests(unittest.TestCase):
+    def test_local_extractor_url_uses_render_port(self):
+        original_port = app.os.environ.get("PORT")
+        try:
+            app.os.environ["PORT"] = "10000"
+            self.assertEqual(app.local_extractor_url(), "http://127.0.0.1:10000/extract")
+        finally:
+            if original_port is None:
+                app.os.environ.pop("PORT", None)
+            else:
+                app.os.environ["PORT"] = original_port
+
     def test_stopped_batch_can_be_started_again_without_waiting_uploads(self):
         self.assertTrue(app.can_start_batch_run({"status": "stopped"}, 0))
 

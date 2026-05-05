@@ -52,6 +52,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 ## Performance / Scale
 
 - Profile 50, 250, and 500 file runs so slow stages are measured rather than guessed.
+- Done: use the local extractor endpoint for UI-started batch runs where possible, avoiding public Render self-calls.
 - Tune `SLEEP_SECONDS` downward once extractor/OpenAI/Airtable rate limits are understood.
 - Tune `EXTRACTOR_TIMEOUT_SECONDS`, `MAX_EXTRACTOR_ATTEMPTS`, and timeout retry behaviour separately for scale tests vs production runs.
 - Add configurable extraction concurrency so multiple files can be OCR/LLM processed in parallel with safe retry/backoff.
