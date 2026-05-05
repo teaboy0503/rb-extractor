@@ -44,13 +44,25 @@ except ZoneInfoNotFoundError:
 
 
 def get_storage_client():
+    global storage_client
+    if storage_client is not None:
+        return storage_client
+
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     credentials = service_account.Credentials.from_service_account_info(creds_dict)
-    return storage.Client(credentials=credentials, project=creds_dict.get("project_id"))
+    storage_client = storage.Client(credentials=credentials, project=creds_dict.get("project_id"))
+    return storage_client
 
 
-storage_client = get_storage_client()
-bucket = storage_client.bucket(BUCKET_NAME)
+storage_client = None
+bucket = None
+
+
+def get_bucket():
+    global bucket
+    if bucket is None:
+        bucket = get_storage_client().bucket(BUCKET_NAME)
+    return bucket
 
 
 def clean_gcs_object_path(row):
@@ -98,8 +110,9 @@ def gcs_path_candidates(gcs_path):
 
 
 def resolve_existing_gcs_path(gcs_path):
+    batch_bucket = get_bucket()
     for candidate in gcs_path_candidates(gcs_path):
-        if bucket.blob(candidate).exists():
+        if batch_bucket.blob(candidate).exists():
             return candidate
 
     raise RuntimeError(f"GCS object not found: gs://{BUCKET_NAME}/{gcs_path}")
@@ -129,7 +142,7 @@ def csv_gcs_object_path(row):
 
 
 def download_results_csv():
-    blob = bucket.blob(RESULTS_PATH)
+    blob = get_bucket().blob(RESULTS_PATH)
     if not blob.exists():
         raise RuntimeError(f"Results CSV not found: gs://{BUCKET_NAME}/{RESULTS_PATH}")
 
@@ -139,7 +152,7 @@ def download_results_csv():
 
 def signed_url_for_gcs_path(gcs_path):
     clean_path = resolve_existing_gcs_path(gcs_path)
-    blob = bucket.blob(clean_path)
+    blob = get_bucket().blob(clean_path)
 
     return blob.generate_signed_url(
         version="v4",

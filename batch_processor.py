@@ -39,21 +39,44 @@ class ExtractionQualityError(RuntimeError):
     pass
 
 
+def normalize_prefix(prefix):
+    prefix = (prefix or "").strip()
+    if prefix and not prefix.endswith("/"):
+        prefix = f"{prefix}/"
+    return prefix
+
+
+INPUT_PREFIX = normalize_prefix(INPUT_PREFIX)
+PROCESSED_PREFIX = normalize_prefix(PROCESSED_PREFIX)
+FAILED_PREFIX = normalize_prefix(FAILED_PREFIX)
+
+storage_client = None
+bucket = None
+
+
 def get_storage_client():
+    global storage_client
+    if storage_client is not None:
+        return storage_client
+
     if not GOOGLE_CREDENTIALS_JSON:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var is missing")
 
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     credentials = service_account.Credentials.from_service_account_info(creds_dict)
-    return storage.Client(credentials=credentials, project=creds_dict.get("project_id"))
+    storage_client = storage.Client(credentials=credentials, project=creds_dict.get("project_id"))
+    return storage_client
 
 
-storage_client = get_storage_client()
-bucket = storage_client.bucket(BUCKET_NAME)
+def get_bucket():
+    global bucket
+    if bucket is None:
+        bucket = get_storage_client().bucket(BUCKET_NAME)
+    return bucket
 
 
 def list_input_blobs():
-    blobs = list(storage_client.list_blobs(BUCKET_NAME, prefix=INPUT_PREFIX))
+    blobs = list(get_storage_client().list_blobs(BUCKET_NAME, prefix=INPUT_PREFIX))
     return [blob for blob in blobs if not blob.name.endswith("/")][:MAX_FILES]
 
 
@@ -119,16 +142,57 @@ def validate_extraction_quality(data):
         )
 
 
-def move_blob(blob, destination_prefix):
-    filename = blob.name.split("/")[-1]
-    destination_name = f"{destination_prefix}{filename}"
-    bucket.copy_blob(blob, bucket, destination_name)
-    blob.delete()
+def relative_input_path(source_path):
+    source_path = (source_path or "").strip("/")
+    input_prefix = normalize_prefix(INPUT_PREFIX)
+
+    if input_prefix and source_path.startswith(input_prefix):
+        relative_path = source_path[len(input_prefix):]
+    else:
+        relative_path = source_path.split("/")[-1]
+
+    parts = [
+        part
+        for part in relative_path.split("/")
+        if part and part not in [".", ".."]
+    ]
+
+    if not parts:
+        parts = [source_path.split("/")[-1] or "unnamed"]
+
+    return "/".join(parts)
+
+
+def destination_object_path(source_path, destination_prefix):
+    return (
+        f"{normalize_prefix(destination_prefix)}"
+        f"{IMPORT_BATCH_ID}/"
+        f"{relative_input_path(source_path)}"
+    )
+
+
+def copy_blob_to_destination(blob, destination_prefix):
+    batch_bucket = get_bucket()
+    destination_name = destination_object_path(blob.name, destination_prefix)
+    destination_blob = batch_bucket.blob(destination_name)
+
+    if not destination_blob.exists():
+        batch_bucket.copy_blob(blob, batch_bucket, destination_name)
+
     return destination_name
 
 
+def delete_source_blob(blob):
+    try:
+        blob.delete()
+        return True
+    except Exception as error:
+        print(f"Warning: could not delete source {blob.name}: {error}")
+        return False
+
+
 def download_existing_results():
-    blob = bucket.blob(RESULTS_PATH)
+    blob = get_bucket().blob(RESULTS_PATH)
 
     if not blob.exists():
         return []
@@ -160,7 +224,7 @@ def upload_results(rows):
 
         temp_path = tmp.name
 
-    bucket.blob(RESULTS_PATH).upload_from_filename(temp_path, content_type="text/csv")
+    get_bucket().blob(RESULTS_PATH).upload_from_filename(temp_path, content_type="text/csv")
 
 
 def result_row_success(source_path, final_path, data, attempts):
@@ -242,18 +306,25 @@ def main():
     rows = download_existing_results()
 
     already_successful = set()
+    successful_final_paths = {}
     for row in rows:
         source = row.get("source_gcs_path", "").strip()
+        final_path = row.get("final_gcs_path", "").strip()
         status = row.get("status", "").strip().lower()
 
         if source and status == "success":
             already_successful.add(source)
+            successful_final_paths[source] = final_path
 
     for blob in blobs:
         source_path = blob.name
 
         if source_path in already_successful:
             print(f"Skipping already successful file: {source_path}")
+            final_path = successful_final_paths.get(source_path, "")
+            if final_path and get_bucket().blob(final_path).exists():
+                if delete_source_blob(blob):
+                    print(f"Cleaned up already processed source: {source_path}")
             continue
 
         print(f"Processing: {source_path}")
@@ -262,25 +333,41 @@ def main():
         try:
             data, attempts = call_extractor_with_retries(source_path)
             validate_extraction_quality(data)
-            final_path = move_blob(blob, PROCESSED_PREFIX)
-
-            rows.append(result_row_success(source_path, final_path, data, attempts))
-            already_successful.add(source_path)
-            upload_results(rows)
-
-            print(f"Success: {source_path} -> {final_path}")
 
         except Exception as error:
             attempts = getattr(error, "attempts", attempts)
             print(f"Failed: {source_path}: {error}")
-
             try:
-                final_path = move_blob(blob, FAILED_PREFIX)
+                final_path = copy_blob_to_destination(blob, FAILED_PREFIX)
             except Exception:
                 final_path = source_path
+            row = result_row_failed(source_path, final_path, error, attempts)
+            rows.append(row)
+            try:
+                upload_results(rows)
+            except Exception:
+                rows.pop()
+                raise
+            if final_path != source_path:
+                delete_source_blob(blob)
+            time.sleep(SLEEP_SECONDS)
+            continue
 
-            rows.append(result_row_failed(source_path, final_path, error, attempts))
+        final_path = copy_blob_to_destination(blob, PROCESSED_PREFIX)
+        row = result_row_success(source_path, final_path, data, attempts)
+        rows.append(row)
+
+        try:
             upload_results(rows)
+        except Exception:
+            rows.pop()
+            raise
+
+        already_successful.add(source_path)
+        successful_final_paths[source_path] = final_path
+        delete_source_blob(blob)
+
+        print(f"Success: {source_path} -> {final_path}")
 
         time.sleep(SLEEP_SECONDS)
 

@@ -14,6 +14,31 @@ The page prompts for the API token in the browser and stores it in session stora
 Browser uploads use signed GCS `PUT` URLs, so the bucket must allow CORS for the
 Render origin before direct browser uploads will succeed.
 
+## Operator Runbook
+
+1. Open `/operator`.
+2. Save the API token.
+3. Create a batch with source, collection, location, and notes as needed.
+4. Upload files. They go directly to GCS under `imports/{batch_id}/to_process/`.
+5. Click **Run Batch**.
+6. Watch the processing steps: queued, batch processor, extraction, Airtable import, complete.
+7. Check Airtable `Items` and the linked `Batches` record.
+8. If failures appear, review the **Failures** panel.
+9. Click **Retry Failed Files** to queue failed GCS objects back into the same batch.
+10. Click **Run Batch** again to process queued retry files.
+
+Successful and failed objects are moved into batch-scoped folders such as
+`processed/{batch_id}/...` and `failed/{batch_id}/...`. This avoids collisions
+between different batches that contain the same camera filename.
+
+The processor writes the result row to the batch CSV before deleting the source
+object from `to_process/`. If a write or move step fails, the source object is
+left in place so it can be safely retried.
+
+After a run succeeds, **Run Batch** is disabled unless new files are waiting.
+Failed or stale runs can be retried. A stale run means the UI found an old
+`running` status without a live run lock.
+
 Set bucket CORS from Google Cloud Shell or a machine with `gcloud` installed:
 
 ```bash
