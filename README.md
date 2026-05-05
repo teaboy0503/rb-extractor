@@ -50,3 +50,19 @@ Check batch status:
 curl "$EXTRACTOR_URL/batches/{batch_id}" \
   -H "Authorization: Bearer $API_KEY"
 ```
+
+List recent operator batches:
+
+```bash
+curl "$EXTRACTOR_URL/batches?limit=20" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Run a batch from the web service:
+
+```bash
+curl -X POST "$EXTRACTOR_URL/batches/{batch_id}/run" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```

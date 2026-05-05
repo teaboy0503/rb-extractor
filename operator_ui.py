@@ -385,9 +385,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     .command-box {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
       gap: 8px;
-      align-items: start;
     }
 
     pre {
@@ -400,6 +398,14 @@ OPERATOR_UI_HTML = """<!doctype html>
       padding: 12px;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
+    }
+
+    .run-log {
+      max-height: 220px;
+      min-height: 0;
+      margin-top: 8px;
+      overflow: auto;
+      font-size: 11px;
     }
 
     .hidden {
@@ -596,12 +602,17 @@ OPERATOR_UI_HTML = """<!doctype html>
 
         <div class="panel">
           <div class="panel-head">
-            <h2>Processing Command</h2>
-            <button id="copyCommandBtn" type="button" disabled>Copy</button>
+            <h2>Processing</h2>
+            <div class="row">
+              <button id="runBatchBtn" type="button" class="primary" disabled>Run Batch</button>
+              <button id="copyCommandBtn" type="button" disabled>Copy Command</button>
+            </div>
           </div>
+          <div id="runStatus" class="status-line"></div>
           <div class="command-box">
             <pre id="runCommand">Create a batch to generate the command.</pre>
           </div>
+          <pre id="runLog" class="run-log hidden"></pre>
         </div>
       </section>
     </section>
@@ -614,6 +625,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       batchId: sessionStorage.getItem("rb_batch_id") || "",
       batch: null,
       batches: [],
+      runPollTimer: null,
       files: [],
       uploads: new Map()
     };
@@ -656,7 +668,10 @@ OPERATOR_UI_HTML = """<!doctype html>
       clearFilesBtn: el("clearFilesBtn"),
       uploadStatus: el("uploadStatus"),
       fileList: el("fileList"),
+      runBatchBtn: el("runBatchBtn"),
+      runStatus: el("runStatus"),
       runCommand: el("runCommand"),
+      runLog: el("runLog"),
       copyCommandBtn: el("copyCommandBtn")
     };
 
@@ -745,7 +760,9 @@ OPERATOR_UI_HTML = """<!doctype html>
         nodes.resultFailed.textContent = "0";
         nodes.runCommand.textContent = "Create a batch to generate the command.";
         nodes.refreshBatchBtn.disabled = true;
+        nodes.runBatchBtn.disabled = true;
         nodes.copyCommandBtn.disabled = true;
+        renderRunStatus(null);
         return;
       }
 
@@ -765,9 +782,51 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.resultFailed.textContent = String(data.results?.failed ?? 0);
       nodes.runCommand.textContent = data.run_command || "No command available.";
       nodes.refreshBatchBtn.disabled = false;
+      nodes.runBatchBtn.disabled = !data.batch_id || data.run?.status === "running" || (data.uploaded_count ?? 0) < 1;
       nodes.copyCommandBtn.disabled = !data.run_command;
+      renderRunStatus(data.run);
       updateUploadButtons();
       renderBatchList();
+    }
+
+    function setRunPolling(active) {
+      if (active && !state.runPollTimer) {
+        state.runPollTimer = window.setInterval(async () => {
+          if (!state.batch?.batch_id) return;
+          await loadBatch(state.batch.batch_id, true);
+          await listBatches(true);
+        }, 5000);
+      } else if (!active && state.runPollTimer) {
+        window.clearInterval(state.runPollTimer);
+        state.runPollTimer = null;
+      }
+    }
+
+    function renderRunStatus(run) {
+      const status = run?.status || "not_started";
+
+      if (status === "running") {
+        setStatus(nodes.runStatus, "Batch is running. This page will refresh status automatically.", "warn");
+        setRunPolling(true);
+      } else if (status === "succeeded") {
+        setStatus(nodes.runStatus, "Batch run finished successfully.", "ok");
+        setRunPolling(false);
+      } else if (status === "failed") {
+        setStatus(nodes.runStatus, run?.error || "Batch run failed.", "error");
+        setRunPolling(false);
+      } else {
+        setStatus(nodes.runStatus, "Ready to run after files are uploaded.");
+        setRunPolling(false);
+      }
+
+      const logTail = (run?.log_tail || "").trim();
+      if (logTail) {
+        nodes.runLog.textContent = logTail;
+        nodes.runLog.classList.remove("hidden");
+      } else {
+        nodes.runLog.textContent = "";
+        nodes.runLog.classList.add("hidden");
+      }
     }
 
     function formatBatchDate(value) {
@@ -808,6 +867,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         const parts = [
           formatBatchDate(batch.created_at),
           batch.location ? `Location: ${batch.location}` : "",
+          batch.run?.status && batch.run.status !== "not_started" ? `Run: ${batch.run.status}` : "",
           `Uploads: ${batch.uploaded_count ?? 0}`,
           `Rows: ${batch.results?.total ?? 0}`,
           `Failed: ${batch.results?.failed ?? 0}`
@@ -857,7 +917,9 @@ OPERATOR_UI_HTML = """<!doctype html>
       try {
         const data = await apiFetch(`/batches/${encodeURIComponent(trimmedBatchId)}`);
         updateBatchView(data);
-        setStatus(nodes.batchStatus, `Loaded ${trimmedBatchId}.`, "ok");
+        if (!quiet) {
+          setStatus(nodes.batchStatus, `Loaded ${trimmedBatchId}.`, "ok");
+        }
       } catch (error) {
         if (!quiet) {
           setStatus(nodes.batchStatus, error.message, "error");
@@ -899,6 +961,25 @@ OPERATOR_UI_HTML = """<!doctype html>
     async function refreshBatch() {
       if (!state.batch?.batch_id) return;
       await loadBatch(state.batch.batch_id);
+    }
+
+    async function runBatch() {
+      if (!state.batch?.batch_id) return;
+      saveAccess();
+      setStatus(nodes.runStatus, "Starting batch run...", "warn");
+      nodes.runBatchBtn.disabled = true;
+
+      try {
+        const data = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/run`, {
+          method: "POST",
+          body: JSON.stringify({})
+        });
+        updateBatchView(data);
+        await listBatches(true);
+      } catch (error) {
+        setStatus(nodes.runStatus, error.message, "error");
+        nodes.runBatchBtn.disabled = !state.batch?.batch_id || (state.batch?.uploaded_count ?? 0) < 1;
+      }
     }
 
     function addFiles(fileList) {
@@ -1092,6 +1173,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.refreshBatchBtn.addEventListener("click", refreshBatch);
       nodes.loadBatchBtn.addEventListener("click", () => loadBatch(nodes.existingBatchInput.value));
       nodes.listBatchesBtn.addEventListener("click", () => listBatches());
+      nodes.runBatchBtn.addEventListener("click", runBatch);
       nodes.chooseFilesBtn.addEventListener("click", () => nodes.fileInput.click());
       nodes.fileInput.addEventListener("change", (event) => addFiles(event.target.files));
       nodes.uploadBtn.addEventListener("click", uploadSelected);

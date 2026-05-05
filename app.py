@@ -4,6 +4,9 @@ import io
 import os
 import json
 import re
+import subprocess
+import sys
+import threading
 from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,7 +31,7 @@ MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
 SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUTES", "60"))
-APP_VERSION = "1.8.0-operator-batches"
+APP_VERSION = "1.9.0-operator-run"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -50,6 +53,10 @@ class CreateUploadUrlRequest(BaseModel):
     filename: str
     content_type: str = "application/octet-stream"
     overwrite: bool = False
+
+
+class RunBatchRequest(BaseModel):
+    force: bool = False
 
 
 def require_bearer_auth(req: Request) -> None:
@@ -106,6 +113,14 @@ def batch_input_prefix(batch_id):
 
 def batch_results_path(batch_id):
     return f"results/batches/{batch_id}.csv"
+
+
+def batch_run_status_path(batch_id):
+    return f"{batch_root_prefix(batch_id)}run_status.json"
+
+
+def batch_run_log_path(batch_id):
+    return f"{batch_root_prefix(batch_id)}run.log"
 
 
 def batch_run_command(batch_id):
@@ -385,6 +400,7 @@ def batch_status_payload(batch_id, bucket=None):
         "location": manifest.get("location", ""),
         "notes": manifest.get("notes", ""),
         "created_at": manifest.get("created_at", ""),
+        "run": read_batch_run_status(batch_id, bucket),
     }
 
 
@@ -406,6 +422,121 @@ def list_operator_batch_ids(bucket):
                 batch_ids.add(batch_id)
 
     return sorted(batch_ids, reverse=True)
+
+
+def read_batch_run_status(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    blob = bucket.blob(batch_run_status_path(batch_id))
+
+    if not blob.exists():
+        return {
+            "status": "not_started",
+            "log_path": batch_run_log_path(batch_id),
+        }
+
+    try:
+        return json.loads(blob.download_as_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {
+            "status": "unknown",
+            "log_path": batch_run_log_path(batch_id),
+            "error": "Run status file could not be parsed.",
+        }
+
+
+def write_batch_run_status(batch_id, data, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    payload = {
+        "batch_id": batch_id,
+        "log_path": batch_run_log_path(batch_id),
+        "updated_at": datetime.now(UTC).isoformat(),
+        **data,
+    }
+    bucket.blob(batch_run_status_path(batch_id)).upload_from_string(
+        json.dumps(payload, indent=2),
+        content_type="application/json",
+    )
+    return payload
+
+
+def upload_batch_run_log(batch_id, log_text, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    bucket.blob(batch_run_log_path(batch_id)).upload_from_string(
+        log_text or "",
+        content_type="text/plain",
+    )
+
+
+def run_batch_pipeline(batch_id):
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    env["IMPORT_BATCH_ID"] = batch_id
+    env["BATCH_INPUT_PREFIX"] = batch_input_prefix(batch_id)
+    env["BATCH_RESULTS_PATH"] = batch_results_path(batch_id)
+    started_at = datetime.now(UTC).isoformat()
+
+    try:
+        bucket = get_bucket(DEFAULT_GCS_BUCKET)
+        write_batch_run_status(
+            batch_id,
+            {
+                "status": "running",
+                "started_at": started_at,
+                "finished_at": "",
+                "return_code": "",
+                "error": "",
+                "log_tail": "",
+            },
+            bucket,
+        )
+
+        completed = subprocess.run(
+            [sys.executable, "run_import_pipeline.py"],
+            cwd=repo_dir,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        log_text = completed.stdout or ""
+        upload_batch_run_log(batch_id, log_text, bucket)
+
+        if completed.returncode == 0:
+            status = "succeeded"
+            error = ""
+        else:
+            status = "failed"
+            error = f"run_import_pipeline.py exited with {completed.returncode}"
+
+        write_batch_run_status(
+            batch_id,
+            {
+                "status": status,
+                "started_at": started_at,
+                "finished_at": datetime.now(UTC).isoformat(),
+                "return_code": completed.returncode,
+                "error": error,
+                "log_tail": log_text[-4000:],
+            },
+            bucket,
+        )
+    except Exception as error:
+        error_text = str(error)
+        try:
+            write_batch_run_status(
+                batch_id,
+                {
+                    "status": "failed",
+                    "started_at": started_at,
+                    "finished_at": datetime.now(UTC).isoformat(),
+                    "return_code": "",
+                    "error": error_text,
+                    "log_tail": error_text,
+                },
+            )
+        except Exception:
+            pass
 
 
 @app.get("/")
@@ -490,6 +621,40 @@ async def get_batch_status(req: Request, batch_id: str):
 
     batch_id = validate_batch_id(batch_id)
     return batch_status_payload(batch_id)
+
+
+@app.post("/batches/{batch_id}/run")
+async def run_batch(req: Request, batch_id: str, body: RunBatchRequest | None = None):
+    require_bearer_auth(req)
+
+    batch_id = validate_batch_id(batch_id)
+    body = body or RunBatchRequest()
+    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    current_run = read_batch_run_status(batch_id, bucket)
+
+    if current_run.get("status") == "running" and not body.force:
+        raise HTTPException(status_code=409, detail="Batch is already running")
+
+    if count_batch_uploads(batch_id, bucket) < 1 and not body.force:
+        raise HTTPException(status_code=400, detail="No files are waiting in this batch")
+
+    write_batch_run_status(
+        batch_id,
+        {
+            "status": "running",
+            "started_at": datetime.now(UTC).isoformat(),
+            "finished_at": "",
+            "return_code": "",
+            "error": "",
+            "log_tail": "Batch run queued.",
+        },
+        bucket,
+    )
+
+    thread = threading.Thread(target=run_batch_pipeline, args=(batch_id,), daemon=True)
+    thread.start()
+
+    return batch_status_payload(batch_id, bucket)
 
 
 @app.post("/extract")

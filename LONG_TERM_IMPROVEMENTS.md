@@ -24,12 +24,15 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 
 - Done: add operator API endpoints to create a batch, generate signed GCS upload URLs, and check batch status.
 - Done: build a small web interface for creating an import batch and uploading many files.
-- Upload directly to GCS using signed upload URLs or resumable uploads rather than proxying large file uploads through FastAPI.
-- Store new uploads under a batch-specific prefix such as `imports/{import_batch_id}/to_process/`.
+- Done: upload directly to GCS using signed upload URLs rather than proxying large file uploads through FastAPI.
+- Done: store new uploads under a batch-specific prefix such as `imports/{import_batch_id}/to_process/`.
+- Done: list recent operator batches in the UI so batches can be recovered after refresh.
 
 ## Operations
 
 - Done: add `run_import_pipeline.py` as the single operator command/job that runs batch processing and Airtable import in sequence.
+- Done: add a UI `Run Batch` action that starts the pipeline and polls durable run status.
+- Later: move batch execution to a dedicated Render worker/job queue before relying on very large production batches.
 - Add dry-run modes for importer and failure recorder.
 - Add a richer failure lifecycle once Supabase exists, for example open, queued_for_retry, retried, resolved, abandoned.
 - Add clearer environment documentation for Render jobs and local runs.
