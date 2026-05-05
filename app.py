@@ -7,6 +7,7 @@ import re
 from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from google.cloud import storage
@@ -14,6 +15,8 @@ from google.cloud import vision
 from google.oauth2 import service_account
 
 from openai import OpenAI
+
+from operator_ui import OPERATOR_UI_HTML
 
 
 API_KEY = os.getenv("API_KEY", "")
@@ -353,6 +356,11 @@ def batch_results_counts(batch_id):
 @app.get("/")
 def health():
     return {"status": "ok", "version": APP_VERSION}
+
+
+@app.get("/operator", response_class=HTMLResponse)
+def operator_ui():
+    return OPERATOR_UI_HTML
 
 
 @app.post("/batches")

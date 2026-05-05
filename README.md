@@ -4,6 +4,16 @@
 
 All endpoints use the same bearer token as `/extract`.
 
+Operator UI:
+
+```text
+https://your-render-service.onrender.com/operator
+```
+
+The page prompts for the API token in the browser and stores it in session storage.
+Browser uploads use signed GCS `PUT` URLs, so the bucket must allow CORS for the
+Render origin before direct browser uploads will succeed.
+
 Create a batch:
 
 ```bash

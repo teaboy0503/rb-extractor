@@ -23,7 +23,7 @@ Living notes for productionising the rare books extraction pipeline. Keep this l
 ## Upload Experience
 
 - Done: add operator API endpoints to create a batch, generate signed GCS upload URLs, and check batch status.
-- Build a small web interface for creating an import batch and uploading many files.
+- Done: build a small web interface for creating an import batch and uploading many files.
 - Upload directly to GCS using signed upload URLs or resumable uploads rather than proxying large file uploads through FastAPI.
 - Store new uploads under a batch-specific prefix such as `imports/{import_batch_id}/to_process/`.
 
