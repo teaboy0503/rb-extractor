@@ -849,6 +849,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       lookupOptions: { collections: [], locations: [] },
       verification: null,
       failures: [],
+      failuresBatchId: "",
       runPollTimer: null,
       uploadInProgress: false,
       files: [],
@@ -1190,6 +1191,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         nodes.refreshFailuresBtn.disabled = true;
         state.verification = null;
         state.failures = [];
+        state.failuresBatchId = "";
         renderRunStatus(null);
         updateUploadButtons();
         renderVerification();
@@ -1207,6 +1209,9 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
       if (previousBatchId && nextBatchId && previousBatchId !== nextBatchId) {
         clearSelectedFiles();
+        state.verification = null;
+        state.failures = [];
+        state.failuresBatchId = "";
         setStatus(nodes.uploadStatus, "Active batch changed; choose files for this batch.", "warn");
       }
       setLookupValue("collections", data.target_collection || "");
@@ -1486,7 +1491,9 @@ OPERATOR_UI_HTML = """<!doctype html>
     }
 
     function renderVerification() {
-      const verification = state.verification;
+      const verification = state.verification?.batch_id === state.batch?.batch_id
+        ? state.verification
+        : null;
       nodes.verificationList.innerHTML = "";
       nodes.refreshVerificationBtn.disabled = !state.batch?.batch_id;
 
@@ -1505,6 +1512,8 @@ OPERATOR_UI_HTML = """<!doctype html>
       const runStatus = verification.run_status?.status || "";
       const runIsActive = runStatus === "running";
       const runWasStopped = runStatus === "stopped";
+      const runWasInterrupted = ["failed", "stale", "unknown"].includes(runStatus);
+      const runHasNotStarted = runStatus === "not_started";
       nodes.verifyKnownFiles.textContent = String(counts.known_file_rows ?? 0);
       nodes.verifyAirtableItems.textContent = counts.airtable_item_records === null || counts.airtable_item_records === undefined
         ? "?"
@@ -1521,6 +1530,12 @@ OPERATOR_UI_HTML = """<!doctype html>
         } else if (runWasStopped) {
           nodes.verificationQueueNote.textContent =
             `${remaining} file${remaining === 1 ? "" : "s"} still waiting after the stopped run. Run the batch again to continue.`;
+        } else if (runWasInterrupted) {
+          nodes.verificationQueueNote.textContent =
+            `${remaining} file${remaining === 1 ? " is" : "s are"} still waiting because the run did not complete. Retry the run when ready.`;
+        } else if (runHasNotStarted) {
+          nodes.verificationQueueNote.textContent =
+            `${remaining} file${remaining === 1 ? " is" : "s are"} uploaded and waiting. Run the batch when ready.`;
         } else {
           nodes.verificationQueueNote.textContent =
             `${remaining} file${remaining === 1 ? "" : "s"} still waiting. This usually means the run reached its per-run file limit. Run the batch again to continue.`;
@@ -1567,13 +1582,16 @@ OPERATOR_UI_HTML = """<!doctype html>
         return;
       }
 
+      const batchId = state.batch.batch_id;
       if (!quiet) {
         setStatus(nodes.verificationStatus, "Checking batch...");
       }
       nodes.refreshVerificationBtn.disabled = true;
 
       try {
-        state.verification = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/verification`);
+        const data = await apiFetch(`/batches/${encodeURIComponent(batchId)}/verification`);
+        if (state.batch?.batch_id !== batchId) return;
+        state.verification = data.batch_id === batchId ? data : null;
         renderVerification();
       } catch (error) {
         if (!quiet) {
@@ -1587,8 +1605,9 @@ OPERATOR_UI_HTML = """<!doctype html>
     function renderFailures() {
       nodes.failureList.innerHTML = "";
       const isRunning = state.batch?.run?.status === "running";
-      const queuedForRetry = state.failures.filter((failure) => failure.retry_queued).length;
-      nodes.retryFailuresBtn.disabled = !state.batch?.batch_id || isRunning || state.failures.length < 1 || queuedForRetry === state.failures.length;
+      const failures = state.failuresBatchId === state.batch?.batch_id ? state.failures : [];
+      const queuedForRetry = failures.filter((failure) => failure.retry_queued).length;
+      nodes.retryFailuresBtn.disabled = !state.batch?.batch_id || isRunning || failures.length < 1 || queuedForRetry === failures.length;
       nodes.refreshFailuresBtn.disabled = !state.batch?.batch_id;
 
       if (!state.batch?.batch_id) {
@@ -1596,7 +1615,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         return;
       }
 
-      if (!state.failures.length) {
+      if (!failures.length) {
         setStatus(nodes.failureStatus, "No unresolved failed files for this batch.", "ok");
         const empty = document.createElement("div");
         empty.className = "empty-state";
@@ -1607,11 +1626,11 @@ OPERATOR_UI_HTML = """<!doctype html>
 
       setStatus(
         nodes.failureStatus,
-        `${state.failures.length} unresolved failed file${state.failures.length === 1 ? "" : "s"}${queuedForRetry ? `, ${queuedForRetry} queued for retry` : ""}.`,
+        `${failures.length} unresolved failed file${failures.length === 1 ? "" : "s"}${queuedForRetry ? `, ${queuedForRetry} queued for retry` : ""}.`,
         "warn"
       );
 
-      for (const failure of state.failures) {
+      for (const failure of failures) {
         const row = document.createElement("div");
         row.className = "failure-row";
 
@@ -1637,18 +1656,22 @@ OPERATOR_UI_HTML = """<!doctype html>
     async function loadFailures(quiet = false) {
       if (!state.batch?.batch_id) {
         state.failures = [];
+        state.failuresBatchId = "";
         renderFailures();
         return;
       }
 
+      const batchId = state.batch.batch_id;
       if (!quiet) {
         setStatus(nodes.failureStatus, "Loading failures...");
       }
       nodes.refreshFailuresBtn.disabled = true;
 
       try {
-        const data = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}/failures`);
+        const data = await apiFetch(`/batches/${encodeURIComponent(batchId)}/failures`);
+        if (state.batch?.batch_id !== batchId) return;
         state.failures = data.failures || [];
+        state.failuresBatchId = data.batch_id || batchId;
         renderFailures();
       } catch (error) {
         if (!quiet) {
@@ -1672,6 +1695,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         });
         state.batch = data.batch || state.batch;
         state.failures = data.failures || [];
+        state.failuresBatchId = state.batch.batch_id || "";
         updateBatchView(state.batch);
         renderFailures();
         await loadVerification(true);

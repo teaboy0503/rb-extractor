@@ -50,7 +50,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.13-report-and-timeout-tuning"
+APP_VERSION = "1.13.14-batch-aware-panels"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -1101,6 +1101,22 @@ def build_batch_verification_checks(
                 "Waiting files",
                 "warn",
                 f"Batch was stopped with {remaining_input_count} file(s) still waiting. Run the batch again to continue.",
+            )
+        )
+    elif run_state in {"failed", "stale", "unknown"} and remaining_input_count:
+        checks.append(
+            verification_check(
+                "Waiting files",
+                "warn",
+                f"{remaining_input_count} file(s) are still waiting because the run did not complete. Retry the run when ready.",
+            )
+        )
+    elif run_state == "not_started" and remaining_input_count:
+        checks.append(
+            verification_check(
+                "Waiting files",
+                "warn",
+                f"{remaining_input_count} file(s) are uploaded and waiting. Run the batch when ready.",
             )
         )
     elif run_state == "succeeded" and already_successful_input_count:
