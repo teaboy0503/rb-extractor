@@ -463,6 +463,13 @@ OPERATOR_UI_HTML = """<!doctype html>
               <button id="createBatchBtn" type="button" class="primary">Create Batch</button>
               <button id="refreshBatchBtn" type="button" disabled>Refresh</button>
             </div>
+            <label>
+              Existing batch ID
+              <input id="existingBatchInput" type="text" autocomplete="off" placeholder="batch-20260505T055830Z">
+            </label>
+            <div class="actions">
+              <button id="loadBatchBtn" type="button">Load Batch</button>
+            </div>
             <div id="batchStatus" class="status-line"></div>
           </div>
         </div>
@@ -554,6 +561,7 @@ OPERATOR_UI_HTML = """<!doctype html>
     const state = {
       token: sessionStorage.getItem("rb_api_token") || "",
       apiBase: sessionStorage.getItem("rb_api_base") || window.location.origin,
+      batchId: sessionStorage.getItem("rb_batch_id") || "",
       batch: null,
       files: [],
       uploads: new Map()
@@ -575,6 +583,8 @@ OPERATOR_UI_HTML = """<!doctype html>
       notesInput: el("notesInput"),
       createBatchBtn: el("createBatchBtn"),
       refreshBatchBtn: el("refreshBatchBtn"),
+      existingBatchInput: el("existingBatchInput"),
+      loadBatchBtn: el("loadBatchBtn"),
       batchStatus: el("batchStatus"),
       batchId: el("batchId"),
       bucketName: el("bucketName"),
@@ -668,6 +678,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     function updateBatchView(data) {
       if (!data) {
+        state.batch = null;
         nodes.batchId.textContent = "None";
         nodes.bucketName.textContent = "None";
         nodes.inputPrefix.textContent = "None";
@@ -683,6 +694,11 @@ OPERATOR_UI_HTML = """<!doctype html>
       }
 
       state.batch = data;
+      state.batchId = data.batch_id || "";
+      if (state.batchId) {
+        sessionStorage.setItem("rb_batch_id", state.batchId);
+        nodes.existingBatchInput.value = state.batchId;
+      }
       nodes.batchId.textContent = data.batch_id || "None";
       nodes.bucketName.textContent = data.bucket || "None";
       nodes.inputPrefix.textContent = data.input_prefix || "None";
@@ -695,6 +711,32 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.refreshBatchBtn.disabled = false;
       nodes.copyCommandBtn.disabled = !data.run_command;
       updateUploadButtons();
+    }
+
+    async function loadBatch(batchId, quiet = false) {
+      const trimmedBatchId = (batchId || "").trim();
+      if (!trimmedBatchId) {
+        setStatus(nodes.batchStatus, "Enter a batch ID to load.", "warn");
+        return;
+      }
+
+      saveAccess();
+      if (!quiet) {
+        setStatus(nodes.batchStatus, "Loading batch...");
+      }
+      nodes.loadBatchBtn.disabled = true;
+
+      try {
+        const data = await apiFetch(`/batches/${encodeURIComponent(trimmedBatchId)}`);
+        updateBatchView(data);
+        setStatus(nodes.batchStatus, `Loaded ${trimmedBatchId}.`, "ok");
+      } catch (error) {
+        if (!quiet) {
+          setStatus(nodes.batchStatus, error.message, "error");
+        }
+      } finally {
+        nodes.loadBatchBtn.disabled = false;
+      }
     }
 
     async function createBatch() {
@@ -727,15 +769,7 @@ OPERATOR_UI_HTML = """<!doctype html>
 
     async function refreshBatch() {
       if (!state.batch?.batch_id) return;
-      setStatus(nodes.batchStatus, "Refreshing...");
-
-      try {
-        const data = await apiFetch(`/batches/${encodeURIComponent(state.batch.batch_id)}`);
-        updateBatchView(data);
-        setStatus(nodes.batchStatus, "Status refreshed.", "ok");
-      } catch (error) {
-        setStatus(nodes.batchStatus, error.message, "error");
-      }
+      await loadBatch(state.batch.batch_id);
     }
 
     function addFiles(fileList) {
@@ -916,6 +950,7 @@ OPERATOR_UI_HTML = """<!doctype html>
     function init() {
       nodes.apiToken.value = state.token;
       nodes.apiBase.value = state.apiBase;
+      nodes.existingBatchInput.value = state.batchId;
       updateBatchView(null);
       renderFiles();
 
@@ -924,6 +959,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.checkApiBtn.addEventListener("click", checkApi);
       nodes.createBatchBtn.addEventListener("click", createBatch);
       nodes.refreshBatchBtn.addEventListener("click", refreshBatch);
+      nodes.loadBatchBtn.addEventListener("click", () => loadBatch(nodes.existingBatchInput.value));
       nodes.chooseFilesBtn.addEventListener("click", () => nodes.fileInput.click());
       nodes.fileInput.addEventListener("change", (event) => addFiles(event.target.files));
       nodes.uploadBtn.addEventListener("click", uploadSelected);
@@ -952,6 +988,10 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.dropzone.addEventListener("drop", (event) => {
         addFiles(event.dataTransfer.files);
       });
+
+      if (state.token && state.batchId) {
+        loadBatch(state.batchId, true);
+      }
     }
 
     init();
