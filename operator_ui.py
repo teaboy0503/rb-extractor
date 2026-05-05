@@ -176,6 +176,13 @@ OPERATOR_UI_HTML = """<!doctype html>
       margin-top: 4px;
     }
 
+    .lookup-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+
     .status-line {
       min-height: 22px;
       color: var(--muted);
@@ -578,12 +585,20 @@ OPERATOR_UI_HTML = """<!doctype html>
             </label>
             <label>
               Target collection
-              <input id="collectionInput" type="text" placeholder="Optional">
+              <div class="lookup-row">
+                <input id="collectionInput" type="text" list="collectionOptions" placeholder="Optional">
+                <button id="addCollectionBtn" type="button">Add</button>
+              </div>
             </label>
             <label>
               Location
-              <input id="locationInput" type="text" placeholder="Optional">
+              <div class="lookup-row">
+                <input id="locationInput" type="text" list="locationOptions" placeholder="Optional">
+                <button id="addLocationBtn" type="button">Add</button>
+              </div>
             </label>
+            <datalist id="collectionOptions"></datalist>
+            <datalist id="locationOptions"></datalist>
             <label>
               Notes
               <textarea id="notesInput" placeholder="Optional"></textarea>
@@ -722,6 +737,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       batchId: sessionStorage.getItem("rb_batch_id") || "",
       batch: null,
       batches: [],
+      lookupOptions: { collections: [], locations: [] },
       failures: [],
       runPollTimer: null,
       files: [],
@@ -740,7 +756,11 @@ OPERATOR_UI_HTML = """<!doctype html>
       accessStatus: el("accessStatus"),
       sourceInput: el("sourceInput"),
       collectionInput: el("collectionInput"),
+      collectionOptions: el("collectionOptions"),
+      addCollectionBtn: el("addCollectionBtn"),
       locationInput: el("locationInput"),
+      locationOptions: el("locationOptions"),
+      addLocationBtn: el("addLocationBtn"),
       notesInput: el("notesInput"),
       createBatchBtn: el("createBatchBtn"),
       refreshBatchBtn: el("refreshBatchBtn"),
@@ -835,6 +855,8 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.apiBase.value = state.apiBase;
       setStatus(nodes.accessStatus, "Cleared.", "warn");
       state.batches = [];
+      state.lookupOptions = { collections: [], locations: [] };
+      renderLookupOptions();
       renderBatchList();
     }
 
@@ -844,9 +866,81 @@ OPERATOR_UI_HTML = """<!doctype html>
         const data = await apiFetch("/");
         nodes.version.textContent = data.version ? `API ${data.version}` : "API ok";
         setStatus(nodes.accessStatus, "API reachable.", "ok");
+        await loadLookupOptions(true);
       } catch (error) {
         nodes.version.textContent = "API check failed";
         setStatus(nodes.accessStatus, error.message, "error");
+      }
+    }
+
+    function renderLookupOptions() {
+      nodes.collectionOptions.innerHTML = "";
+      nodes.locationOptions.innerHTML = "";
+
+      for (const option of state.lookupOptions.collections || []) {
+        const item = document.createElement("option");
+        item.value = option.name;
+        nodes.collectionOptions.appendChild(item);
+      }
+
+      for (const option of state.lookupOptions.locations || []) {
+        const item = document.createElement("option");
+        item.value = option.name;
+        nodes.locationOptions.appendChild(item);
+      }
+    }
+
+    async function loadLookupOptions(quiet = false) {
+      if (!state.token) return;
+
+      try {
+        const data = await apiFetch("/airtable-options");
+        state.lookupOptions = {
+          collections: data.collections || [],
+          locations: data.locations || []
+        };
+        renderLookupOptions();
+        if (!quiet) {
+          setStatus(nodes.batchStatus, "Loaded collection and location options.", "ok");
+        }
+      } catch (error) {
+        if (!quiet) {
+          setStatus(nodes.batchStatus, error.message, "error");
+        }
+      }
+    }
+
+    async function addLookupOption(kind) {
+      saveAccess();
+      const input = kind === "collections" ? nodes.collectionInput : nodes.locationInput;
+      const label = kind === "collections" ? "collection" : "location";
+      const value = input.value.trim();
+
+      if (!value) {
+        setStatus(nodes.batchStatus, `Enter a ${label} first.`, "warn");
+        return;
+      }
+
+      const button = kind === "collections" ? nodes.addCollectionBtn : nodes.addLocationBtn;
+      button.disabled = true;
+      setStatus(nodes.batchStatus, `Adding ${label}...`);
+
+      try {
+        const data = await apiFetch(`/airtable-options/${kind}`, {
+          method: "POST",
+          body: JSON.stringify({ name: value })
+        });
+        await loadLookupOptions(true);
+        input.value = data.name || value;
+        setStatus(
+          nodes.batchStatus,
+          `${data.created ? "Added" : "Found existing"} ${label}: ${input.value}.`,
+          "ok"
+        );
+      } catch (error) {
+        setStatus(nodes.batchStatus, error.message, "error");
+      } finally {
+        button.disabled = false;
       }
     }
 
@@ -880,6 +974,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         sessionStorage.setItem("rb_batch_id", state.batchId);
         nodes.existingBatchInput.value = state.batchId;
       }
+      nodes.collectionInput.value = data.target_collection || "";
+      nodes.locationInput.value = data.location || "";
       nodes.batchId.textContent = data.batch_id || "None";
       nodes.bucketName.textContent = data.bucket || "None";
       nodes.inputPrefix.textContent = data.input_prefix || "None";
@@ -1113,6 +1209,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         meta.className = "batch-row-meta";
         const parts = [
           formatBatchDate(batch.created_at),
+          batch.target_collection ? `Collection: ${batch.target_collection}` : "",
           batch.location ? `Location: ${batch.location}` : "",
           batch.run?.status && batch.run.status !== "not_started" ? `Run: ${batch.run.status}` : "",
           `Uploads: ${batch.uploaded_count ?? 0}`,
@@ -1526,6 +1623,8 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.clearAccessBtn.addEventListener("click", clearAccess);
       nodes.checkApiBtn.addEventListener("click", checkApi);
       nodes.createBatchBtn.addEventListener("click", createBatch);
+      nodes.addCollectionBtn.addEventListener("click", () => addLookupOption("collections"));
+      nodes.addLocationBtn.addEventListener("click", () => addLookupOption("locations"));
       nodes.refreshBatchBtn.addEventListener("click", refreshBatch);
       nodes.loadBatchBtn.addEventListener("click", () => loadBatch(nodes.existingBatchInput.value));
       nodes.listBatchesBtn.addEventListener("click", () => listBatches());
@@ -1565,6 +1664,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         loadBatch(state.batchId, true);
       }
       if (state.token) {
+        loadLookupOptions(true);
         listBatches(true);
       }
     }

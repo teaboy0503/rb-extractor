@@ -195,6 +195,56 @@ class AirtablePathTests(unittest.TestCase):
         )
 
 
+class BatchMetadataTests(unittest.TestCase):
+    def setUp(self):
+        self.original_manifest_cache = airtable_importer.batch_manifest_cache
+        self.original_batch_target_collection = airtable_importer.BATCH_TARGET_COLLECTION
+        self.original_batch_location = airtable_importer.BATCH_LOCATION
+
+    def tearDown(self):
+        airtable_importer.batch_manifest_cache = self.original_manifest_cache
+        airtable_importer.BATCH_TARGET_COLLECTION = self.original_batch_target_collection
+        airtable_importer.BATCH_LOCATION = self.original_batch_location
+
+    def test_batch_manifest_keeps_collection_and_location(self):
+        body = app.CreateBatchRequest(
+            source="web-upload",
+            target_collection="Rare Books",
+            location="Shelf A",
+            notes="Small smoke test",
+        )
+
+        manifest = app.batch_manifest("batch-1", body)
+
+        self.assertEqual(manifest["target_collection"], "Rare Books")
+        self.assertEqual(manifest["location"], "Shelf A")
+
+    def test_importer_reads_collection_and_location_from_manifest(self):
+        airtable_importer.batch_manifest_cache = {
+            "target_collection": "Rare Books",
+            "location": "Shelf A",
+        }
+        airtable_importer.BATCH_TARGET_COLLECTION = ""
+        airtable_importer.BATCH_LOCATION = ""
+
+        self.assertEqual(
+            airtable_importer.batch_metadata_value("target_collection"),
+            "Rare Books",
+        )
+        self.assertEqual(
+            airtable_importer.batch_metadata_value("location"),
+            "Shelf A",
+        )
+
+    def test_importer_env_metadata_overrides_manifest(self):
+        airtable_importer.batch_manifest_cache = {"target_collection": "Rare Books"}
+
+        self.assertEqual(
+            airtable_importer.batch_metadata_value("target_collection", "Archive"),
+            "Archive",
+        )
+
+
 class FailureRetryTests(unittest.TestCase):
     def setUp(self):
         self.original_download_rows = app.download_batch_results_rows

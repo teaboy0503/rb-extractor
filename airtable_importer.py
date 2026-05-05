@@ -13,9 +13,12 @@ from google.oauth2 import service_account
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 BUCKET_NAME = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
+BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
 RESULTS_PATH = os.getenv("BATCH_RESULTS_PATH", "results/batch_results.csv")
 IMPORT_BATCH_ID = os.getenv("IMPORT_BATCH_ID", "").strip()
 IMPORT_TIMEZONE = os.getenv("IMPORT_TIMEZONE", "Europe/London")
+BATCH_TARGET_COLLECTION = os.getenv("BATCH_TARGET_COLLECTION", "").strip()
+BATCH_LOCATION = os.getenv("BATCH_LOCATION", "").strip()
 
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
@@ -29,11 +32,19 @@ AIRTABLE_FAILURE_TABLE_NAME = os.getenv("AIRTABLE_FAILURE_TABLE_NAME", "")
 AIRTABLE_FAILURE_BATCH_LINK_FIELD = os.getenv("AIRTABLE_FAILURE_BATCH_LINK_FIELD", "")
 AIRTABLE_FAILURE_RESOLVED_FIELD = os.getenv("AIRTABLE_FAILURE_RESOLVED_FIELD", "Resolved?")
 AIRTABLE_QUALITY_FLAGS_FIELD = os.getenv("AIRTABLE_QUALITY_FLAGS_FIELD", "")
+AIRTABLE_COLLECTIONS_TABLE_NAME = os.getenv("AIRTABLE_COLLECTIONS_TABLE_NAME", "Collections")
+AIRTABLE_COLLECTION_NAME_FIELD = os.getenv("AIRTABLE_COLLECTION_NAME_FIELD", "Collection name")
+AIRTABLE_ITEM_COLLECTION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_COLLECTION_LINK_FIELD", "Collection (linked)")
+AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
+AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
+AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
 
 MAX_IMPORT_ROWS = int(os.getenv("MAX_IMPORT_ROWS", "25"))
 MAX_FAILURE_IMPORT_ROWS = int(os.getenv("MAX_FAILURE_IMPORT_ROWS", str(MAX_IMPORT_ROWS)))
 
 batch_record_cache = {}
+lookup_record_cache = {}
+batch_manifest_cache = None
 
 try:
     import_timezone = ZoneInfo(IMPORT_TIMEZONE)
@@ -63,6 +74,44 @@ def get_bucket():
     if bucket is None:
         bucket = get_storage_client().bucket(BUCKET_NAME)
     return bucket
+
+
+def normalize_prefix(prefix):
+    prefix = (prefix or "").strip()
+    if prefix and not prefix.endswith("/"):
+        prefix = f"{prefix}/"
+    return prefix
+
+
+def batch_root_prefix(batch_id):
+    return f"{normalize_prefix(BATCH_UPLOAD_ROOT_PREFIX)}{batch_id}/"
+
+
+def read_batch_manifest():
+    global batch_manifest_cache
+    if batch_manifest_cache is not None:
+        return batch_manifest_cache
+    if not IMPORT_BATCH_ID:
+        batch_manifest_cache = {}
+        return batch_manifest_cache
+
+    blob = get_bucket().blob(f"{batch_root_prefix(IMPORT_BATCH_ID)}batch.json")
+    if not blob.exists():
+        batch_manifest_cache = {}
+        return batch_manifest_cache
+
+    try:
+        batch_manifest_cache = json.loads(blob.download_as_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        batch_manifest_cache = {}
+
+    return batch_manifest_cache
+
+
+def batch_metadata_value(key, env_value=""):
+    if env_value:
+        return env_value
+    return (read_batch_manifest().get(key) or "").strip()
 
 
 def clean_gcs_object_path(row):
@@ -185,6 +234,67 @@ def airtable_formula_string(value):
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def get_or_create_lookup_record(table_name, name_field, value):
+    value = (value or "").strip()
+    if not value or not table_name or not name_field:
+        return None
+
+    cache_key = (table_name, name_field, value.lower())
+    if cache_key in lookup_record_cache:
+        return lookup_record_cache[cache_key]
+
+    response = requests.get(
+        airtable_url(table_name),
+        headers=airtable_headers(),
+        params={
+            "filterByFormula": f"{{{name_field}}} = {airtable_formula_string(value)}",
+            "maxRecords": 1,
+        },
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Airtable lookup error {response.status_code}: {response.text}")
+
+    records = response.json().get("records", [])
+    if records:
+        record_id = records[0]["id"]
+        lookup_record_cache[cache_key] = record_id
+        return record_id
+
+    response = requests.post(
+        airtable_url(table_name),
+        headers=airtable_headers(),
+        json={"fields": {name_field: value}},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Airtable lookup create error {response.status_code}: {response.text}")
+
+    record_id = response.json()["id"]
+    lookup_record_cache[cache_key] = record_id
+    return record_id
+
+
+def batch_collection_record_id():
+    collection_name = batch_metadata_value("target_collection", BATCH_TARGET_COLLECTION)
+    return get_or_create_lookup_record(
+        AIRTABLE_COLLECTIONS_TABLE_NAME,
+        AIRTABLE_COLLECTION_NAME_FIELD,
+        collection_name,
+    )
+
+
+def batch_location_record_id():
+    location_name = batch_metadata_value("location", BATCH_LOCATION)
+    return get_or_create_lookup_record(
+        AIRTABLE_LOCATIONS_TABLE_NAME,
+        AIRTABLE_LOCATION_NAME_FIELD,
+        location_name,
+    )
+
+
 def retry_count_for_row(row):
     attempts = row.get("extraction_attempts")
     if attempts in [None, ""]:
@@ -292,6 +402,22 @@ def validate_required_airtable_fields():
 
     if AIRTABLE_ITEM_BATCH_LINK_FIELD not in items_fields:
         missing.append(f"{AIRTABLE_TABLE_NAME} -> {AIRTABLE_ITEM_BATCH_LINK_FIELD}")
+
+    collection_name = batch_metadata_value("target_collection", BATCH_TARGET_COLLECTION)
+    if collection_name and AIRTABLE_ITEM_COLLECTION_LINK_FIELD:
+        if AIRTABLE_ITEM_COLLECTION_LINK_FIELD not in items_fields:
+            missing.append(f"{AIRTABLE_TABLE_NAME} -> {AIRTABLE_ITEM_COLLECTION_LINK_FIELD}")
+        collection_fields = table_fields(AIRTABLE_COLLECTIONS_TABLE_NAME)
+        if AIRTABLE_COLLECTION_NAME_FIELD not in collection_fields:
+            missing.append(f"{AIRTABLE_COLLECTIONS_TABLE_NAME} -> {AIRTABLE_COLLECTION_NAME_FIELD}")
+
+    location_name = batch_metadata_value("location", BATCH_LOCATION)
+    if location_name and AIRTABLE_ITEM_LOCATION_LINK_FIELD:
+        if AIRTABLE_ITEM_LOCATION_LINK_FIELD not in items_fields:
+            missing.append(f"{AIRTABLE_TABLE_NAME} -> {AIRTABLE_ITEM_LOCATION_LINK_FIELD}")
+        location_fields = table_fields(AIRTABLE_LOCATIONS_TABLE_NAME)
+        if AIRTABLE_LOCATION_NAME_FIELD not in location_fields:
+            missing.append(f"{AIRTABLE_LOCATIONS_TABLE_NAME} -> {AIRTABLE_LOCATION_NAME_FIELD}")
 
     if missing:
         raise RuntimeError(
@@ -443,6 +569,8 @@ def create_airtable_record(row):
     clean_path = resolve_existing_gcs_path(clean_gcs_object_path(row))
     image_url = signed_url_for_gcs_path(clean_path)
     batch_record_id = get_or_create_batch_record(row.get("import_batch_id"))
+    collection_record_id = batch_collection_record_id()
+    location_record_id = batch_location_record_id()
 
     fields = {
         "Title page image": [
@@ -487,6 +615,10 @@ def create_airtable_record(row):
 
     if batch_record_id:
         fields[AIRTABLE_ITEM_BATCH_LINK_FIELD] = [batch_record_id]
+    if collection_record_id and AIRTABLE_ITEM_COLLECTION_LINK_FIELD:
+        fields[AIRTABLE_ITEM_COLLECTION_LINK_FIELD] = [collection_record_id]
+    if location_record_id and AIRTABLE_ITEM_LOCATION_LINK_FIELD:
+        fields[AIRTABLE_ITEM_LOCATION_LINK_FIELD] = [location_record_id]
 
     fields = {k: v for k, v in fields.items() if v not in [None, ""]}
 

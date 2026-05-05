@@ -14,6 +14,19 @@ The page prompts for the API token in the browser and stores it in session stora
 Browser uploads use signed GCS `PUT` URLs, so the bucket must allow CORS for the
 Render origin before direct browser uploads will succeed.
 
+Collection and location selectors read from Airtable. The UI lets an operator
+choose existing values or add new ones before creating a batch. The importer
+then writes linked records into `Items` using these defaults:
+
+```text
+AIRTABLE_COLLECTIONS_TABLE_NAME=Collections
+AIRTABLE_COLLECTION_NAME_FIELD=Collection name
+AIRTABLE_ITEM_COLLECTION_LINK_FIELD=Collection (linked)
+AIRTABLE_LOCATIONS_TABLE_NAME=Locations
+AIRTABLE_LOCATION_NAME_FIELD=Location Code
+AIRTABLE_ITEM_LOCATION_LINK_FIELD=Location
+```
+
 ## Operator Runbook
 
 1. Open `/operator`.

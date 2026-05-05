@@ -11,6 +11,7 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import requests
 from google.api_core.exceptions import NotFound, PreconditionFailed
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -35,6 +36,12 @@ DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
 SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUTES", "60"))
 BATCH_RUN_LOCK_TTL_SECONDS = int(os.getenv("BATCH_RUN_LOCK_TTL_SECONDS", "21600"))
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
+AIRTABLE_COLLECTIONS_TABLE_NAME = os.getenv("AIRTABLE_COLLECTIONS_TABLE_NAME", "Collections")
+AIRTABLE_COLLECTION_NAME_FIELD = os.getenv("AIRTABLE_COLLECTION_NAME_FIELD", "Collection name")
+AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
+AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 APP_VERSION = "1.12.0-operator-failures"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
@@ -67,6 +74,10 @@ class RetryFailuresRequest(BaseModel):
     max_files: int = 25
 
 
+class CreateLookupOptionRequest(BaseModel):
+    name: str
+
+
 def require_bearer_auth(req: Request) -> None:
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API_KEY env var not set")
@@ -78,6 +89,142 @@ def require_bearer_auth(req: Request) -> None:
     token = auth.split(" ", 1)[1].strip()
     if token != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid token")
+
+
+def require_airtable_config():
+    if not AIRTABLE_API_KEY:
+        raise HTTPException(status_code=500, detail="AIRTABLE_API_KEY env var not set")
+    if not AIRTABLE_BASE_ID:
+        raise HTTPException(status_code=500, detail="AIRTABLE_BASE_ID env var not set")
+
+
+def airtable_headers():
+    return {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def airtable_url(table_name, record_id=None):
+    from urllib.parse import quote
+
+    base = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{quote(table_name)}"
+    if record_id:
+        return f"{base}/{record_id}"
+    return base
+
+
+def airtable_formula_string(value):
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def airtable_lookup_config(kind):
+    configs = {
+        "collections": {
+            "table": AIRTABLE_COLLECTIONS_TABLE_NAME,
+            "field": AIRTABLE_COLLECTION_NAME_FIELD,
+        },
+        "locations": {
+            "table": AIRTABLE_LOCATIONS_TABLE_NAME,
+            "field": AIRTABLE_LOCATION_NAME_FIELD,
+        },
+    }
+    if kind not in configs:
+        raise HTTPException(status_code=404, detail="Unknown lookup type")
+    return configs[kind]
+
+
+def list_airtable_lookup_options(kind, limit=200):
+    require_airtable_config()
+    config = airtable_lookup_config(kind)
+    options = []
+    offset = None
+
+    while len(options) < limit:
+        params = {
+            "pageSize": min(100, limit - len(options)),
+            "sort[0][field]": config["field"],
+            "sort[0][direction]": "asc",
+        }
+        if offset:
+            params["offset"] = offset
+
+        response = requests.get(
+            airtable_url(config["table"]),
+            headers=airtable_headers(),
+            params=params,
+            timeout=60,
+        )
+
+        if not response.ok:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Airtable lookup read failed: {response.text}",
+            )
+
+        data = response.json()
+        for record in data.get("records", []):
+            name = (record.get("fields", {}).get(config["field"]) or "").strip()
+            if name:
+                options.append({"id": record["id"], "name": name})
+
+        offset = data.get("offset")
+        if not offset:
+            break
+
+    return options
+
+
+def get_or_create_airtable_lookup_option(kind, name):
+    require_airtable_config()
+    config = airtable_lookup_config(kind)
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+
+    response = requests.get(
+        airtable_url(config["table"]),
+        headers=airtable_headers(),
+        params={
+            "filterByFormula": f"{{{config['field']}}} = {airtable_formula_string(name)}",
+            "maxRecords": 1,
+        },
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Airtable lookup read failed: {response.text}",
+        )
+
+    records = response.json().get("records", [])
+    if records:
+        return {
+            "id": records[0]["id"],
+            "name": records[0].get("fields", {}).get(config["field"], name),
+            "created": False,
+        }
+
+    response = requests.post(
+        airtable_url(config["table"]),
+        headers=airtable_headers(),
+        json={"fields": {config["field"]: name}},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Airtable lookup create failed: {response.text}",
+        )
+
+    record = response.json()
+    return {
+        "id": record["id"],
+        "name": record.get("fields", {}).get(config["field"], name),
+        "created": True,
+    }
 
 
 def get_google_credentials():
@@ -877,6 +1024,9 @@ def run_batch_pipeline(batch_id, run_id):
 
     try:
         bucket = get_bucket(DEFAULT_GCS_BUCKET)
+        manifest = read_batch_manifest(batch_id, bucket)
+        env["BATCH_TARGET_COLLECTION"] = manifest.get("target_collection", "")
+        env["BATCH_LOCATION"] = manifest.get("location", "")
         write_running_status(bucket, "Batch run queued.\n")
 
         process = subprocess.Popen(
@@ -986,6 +1136,28 @@ async def list_batches(req: Request, limit: int = 20):
     return {
         "bucket": DEFAULT_GCS_BUCKET,
         "batches": batches[:limit],
+    }
+
+
+@app.get("/airtable-options")
+async def get_airtable_options(req: Request):
+    require_bearer_auth(req)
+
+    return {
+        "collections": list_airtable_lookup_options("collections"),
+        "locations": list_airtable_lookup_options("locations"),
+    }
+
+
+@app.post("/airtable-options/{kind}")
+async def create_airtable_option(req: Request, kind: str, body: CreateLookupOptionRequest):
+    require_bearer_auth(req)
+
+    option = get_or_create_airtable_lookup_option(kind, body.name)
+
+    return {
+        "kind": kind,
+        **option,
     }
 
 
