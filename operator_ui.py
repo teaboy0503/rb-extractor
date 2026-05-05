@@ -1024,6 +1024,21 @@ OPERATOR_UI_HTML = """<!doctype html>
       renderLookupSelect("locations");
     }
 
+    function lookupDiagnosticMessage(data) {
+      const diagnostics = data.diagnostics || {};
+      const collectionCount = data.collections?.length || 0;
+      const locationCount = data.locations?.length || 0;
+      const warnings = [
+        ...(diagnostics.collections?.warnings || []),
+        ...(diagnostics.locations?.warnings || [])
+      ];
+      const counts = `Loaded ${collectionCount} collection${collectionCount === 1 ? "" : "s"} and ${locationCount} location${locationCount === 1 ? "" : "s"}.`;
+      return {
+        message: warnings.length ? `${counts} ${warnings.join(" ")}` : counts,
+        type: warnings.length ? "warn" : "ok"
+      };
+    }
+
     function setLookupValue(kind, value) {
       const { select, input } = lookupNodes(kind);
       const options = state.lookupOptions[kind] || [];
@@ -1051,13 +1066,12 @@ OPERATOR_UI_HTML = """<!doctype html>
           locations: data.locations || []
         };
         renderLookupOptions();
-        if (!quiet) {
-          setStatus(nodes.batchStatus, "Loaded collection and location options.", "ok");
+        const diagnostic = lookupDiagnosticMessage(data);
+        if (!quiet || diagnostic.type === "warn" || !state.lookupOptions.collections.length || !state.lookupOptions.locations.length) {
+          setStatus(nodes.batchStatus, diagnostic.message, diagnostic.type);
         }
       } catch (error) {
-        if (!quiet) {
-          setStatus(nodes.batchStatus, error.message, "error");
-        }
+        setStatus(nodes.batchStatus, `Could not load collection/location dropdowns: ${error.message}`, "error");
       }
     }
 

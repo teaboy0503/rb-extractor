@@ -48,7 +48,7 @@ AIRTABLE_ITEM_COLLECTION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_COLLECTION_LINK_F
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.0-batch-verification"
+APP_VERSION = "1.13.1-lookup-options"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -140,18 +140,30 @@ def airtable_lookup_config(kind):
     return configs[kind]
 
 
-def list_airtable_lookup_options(kind, limit=200):
+def airtable_lookup_display_name(fields, preferred_field):
+    preferred = fields.get(preferred_field)
+    if preferred not in [None, ""]:
+        return str(preferred).strip(), preferred_field
+
+    for field_name, value in fields.items():
+        if value in [None, ""] or isinstance(value, (dict, list)):
+            continue
+        return str(value).strip(), field_name
+
+    return "", ""
+
+
+def list_airtable_lookup_options(kind, limit=1000):
     require_airtable_config()
     config = airtable_lookup_config(kind)
     options = []
+    seen = set()
+    used_fields = set()
+    records_seen = 0
     offset = None
 
     while len(options) < limit:
-        params = {
-            "pageSize": min(100, limit - len(options)),
-            "sort[0][field]": config["field"],
-            "sort[0][direction]": "asc",
-        }
+        params = {"pageSize": min(100, limit - len(options))}
         if offset:
             params["offset"] = offset
 
@@ -170,15 +182,35 @@ def list_airtable_lookup_options(kind, limit=200):
 
         data = response.json()
         for record in data.get("records", []):
-            name = (record.get("fields", {}).get(config["field"]) or "").strip()
-            if name:
-                options.append({"id": record["id"], "name": name})
+            records_seen += 1
+            name, field_name = airtable_lookup_display_name(record.get("fields", {}), config["field"])
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            used_fields.add(field_name)
+            options.append({"id": record["id"], "name": name})
 
         offset = data.get("offset")
         if not offset:
             break
 
-    return options
+    options.sort(key=lambda option: option["name"].lower())
+    warnings = []
+    if records_seen and config["field"] not in used_fields:
+        warnings.append(
+            f"Configured field '{config['field']}' was not populated; using visible Airtable values instead."
+        )
+
+    return {
+        "options": options,
+        "records_seen": records_seen,
+        "field": config["field"],
+        "fields_used": sorted(used_fields),
+        "warnings": warnings,
+    }
 
 
 def get_or_create_airtable_lookup_option(kind, name):
@@ -1450,10 +1482,16 @@ async def list_batches(req: Request, limit: int = 20):
 @app.get("/airtable-options")
 async def get_airtable_options(req: Request):
     require_bearer_auth(req)
+    collections = list_airtable_lookup_options("collections")
+    locations = list_airtable_lookup_options("locations")
 
     return {
-        "collections": list_airtable_lookup_options("collections"),
-        "locations": list_airtable_lookup_options("locations"),
+        "collections": collections["options"],
+        "locations": locations["options"],
+        "diagnostics": {
+            "collections": {key: value for key, value in collections.items() if key != "options"},
+            "locations": {key: value for key, value in locations.items() if key != "options"},
+        },
     }
 
 

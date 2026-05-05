@@ -245,6 +245,26 @@ class BatchMetadataTests(unittest.TestCase):
         )
 
 
+class LookupOptionsTests(unittest.TestCase):
+    def test_lookup_display_name_prefers_configured_field(self):
+        name, field = app.airtable_lookup_display_name(
+            {"Collection name": "Rare Books", "Other": "Fallback"},
+            "Collection name",
+        )
+
+        self.assertEqual(name, "Rare Books")
+        self.assertEqual(field, "Collection name")
+
+    def test_lookup_display_name_falls_back_to_visible_scalar_field(self):
+        name, field = app.airtable_lookup_display_name(
+            {"Name": "Rare Books", "Notes": "Do not use"},
+            "Collection name",
+        )
+
+        self.assertEqual(name, "Rare Books")
+        self.assertEqual(field, "Name")
+
+
 class BatchVerificationTests(unittest.TestCase):
     def test_verification_checks_are_ok_when_counts_match(self):
         checks = app.build_batch_verification_checks(
