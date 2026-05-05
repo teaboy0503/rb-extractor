@@ -570,9 +570,9 @@ def update_batch_summary(rows, summary):
     print(f"Updated batch summary: {batch_name}")
 
 
-def get_existing_gcs_paths():
+def get_existing_gcs_records():
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    existing = set()
+    existing = {}
     offset = None
 
     while True:
@@ -591,13 +591,17 @@ def get_existing_gcs_paths():
             fields = record.get("fields", {})
             path = fields.get("GCS object path raw") or fields.get("GCS object path")
             if path:
-                existing.add(path)
+                existing[path] = record
 
         offset = data.get("offset")
         if not offset:
             break
 
     return existing
+
+
+def get_existing_gcs_paths():
+    return set(get_existing_gcs_records())
 
 
 def get_existing_failure_paths():
@@ -705,6 +709,61 @@ def create_airtable_record(row):
     return response.json()
 
 
+def add_link_if_missing(fields, record_fields, field_name, record_id):
+    if not field_name or not record_id:
+        return
+
+    existing = record_fields.get(field_name) or []
+    if record_id in existing:
+        return
+
+    fields[field_name] = [*existing, record_id]
+
+
+def fill_link_if_empty(fields, record_fields, field_name, record_id):
+    if not field_name or not record_id:
+        return
+
+    existing = record_fields.get(field_name) or []
+    if existing:
+        return
+
+    fields[field_name] = [record_id]
+
+
+def update_existing_airtable_record_links(row, record):
+    fields = {}
+    record_fields = record.get("fields", {})
+    batch_record_id = get_or_create_batch_record(row.get("import_batch_id"))
+    collection_record_id = batch_collection_record_id()
+    location_record_id = batch_location_record_id()
+
+    add_link_if_missing(
+        fields,
+        record_fields,
+        AIRTABLE_ITEM_BATCH_LINK_FIELD,
+        batch_record_id,
+    )
+    fill_link_if_empty(
+        fields,
+        record_fields,
+        resolved_item_collection_link_field,
+        collection_record_id,
+    )
+    fill_link_if_empty(
+        fields,
+        record_fields,
+        resolved_item_location_link_field,
+        location_record_id,
+    )
+
+    if not fields:
+        return False
+
+    update_airtable_record(AIRTABLE_TABLE_NAME, record["id"], fields)
+    return True
+
+
 def create_failure_record(row):
     gcs_path = csv_gcs_object_path(row)
     batch_record_id = get_or_create_batch_record(row.get("import_batch_id"))
@@ -756,7 +815,8 @@ def main():
     print(f"Found {len(successful_rows)} successful rows in CSV")
     print(f"Found {len(failed_rows)} failed rows in CSV")
 
-    existing_paths = get_existing_gcs_paths()
+    existing_records = get_existing_gcs_records()
+    existing_paths = set(existing_records)
     print(f"Found {len(existing_paths)} existing Airtable records with GCS paths")
     existing_failure_paths = get_existing_failure_paths()
     if AIRTABLE_FAILURE_TABLE_NAME:
@@ -784,6 +844,8 @@ def main():
 
         existing_gcs_path = existing_path_for_gcs_path(gcs_path, existing_paths)
         if existing_gcs_path:
+            if update_existing_airtable_record_links(row, existing_records[existing_gcs_path]):
+                print(f"Updated duplicate metadata: {row.get('Original filename')} -> {existing_gcs_path}")
             duplicate_skipped += 1
             skipped += 1
             if len(duplicate_examples) < 5:
@@ -799,6 +861,8 @@ def main():
 
         existing_gcs_path = existing_path_for_gcs_path(gcs_path, existing_paths)
         if existing_gcs_path:
+            if update_existing_airtable_record_links(row, existing_records[existing_gcs_path]):
+                print(f"Updated duplicate metadata: {row.get('Original filename')} -> {existing_gcs_path}")
             duplicate_skipped += 1
             skipped += 1
             if len(duplicate_examples) < 5:
@@ -806,8 +870,9 @@ def main():
             continue
 
         print(f"Importing: {row.get('Original filename')} -> {gcs_path}")
-        create_airtable_record(row)
+        record = create_airtable_record(row)
         existing_paths.add(gcs_path)
+        existing_records[gcs_path] = record
         imported += 1
 
     if AIRTABLE_FAILURE_TABLE_NAME:

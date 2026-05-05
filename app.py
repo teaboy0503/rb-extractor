@@ -49,7 +49,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.3-error-report"
+APP_VERSION = "1.13.4-metadata-heal"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -402,6 +402,53 @@ def list_airtable_records(table_name, params=None, limit=1000):
             break
 
     return records
+
+
+def get_airtable_schema_tables():
+    require_airtable_config()
+    response = requests.get(airtable_meta_url(), headers=airtable_headers(), timeout=60)
+    if response.status_code == 403:
+        raise RuntimeError("Airtable token lacks schema.bases:read.")
+    if not response.ok:
+        raise RuntimeError(f"Airtable schema read failed: {response.status_code}: {response.text}")
+    return response.json().get("tables", [])
+
+
+def airtable_table_by_name(tables, table_name):
+    for table in tables:
+        if table.get("name") == table_name:
+            return table
+    return None
+
+
+def resolve_airtable_item_link_field(tables, configured_field, linked_table_name, fallback_names):
+    if not tables or not configured_field:
+        return configured_field
+
+    items_table = airtable_table_by_name(tables, AIRTABLE_TABLE_NAME)
+    linked_table = airtable_table_by_name(tables, linked_table_name)
+    if not items_table or not linked_table:
+        return configured_field
+
+    linked_table_id = linked_table.get("id")
+    link_fields = []
+    for field in items_table.get("fields", []):
+        if field.get("type") != "multipleRecordLinks":
+            continue
+        if field.get("options", {}).get("linkedTableId") == linked_table_id:
+            link_fields.append(field.get("name", ""))
+
+    if configured_field in link_fields:
+        return configured_field
+
+    for fallback_name in fallback_names:
+        if fallback_name in link_fields:
+            return fallback_name
+
+    if len(link_fields) == 1:
+        return link_fields[0]
+
+    return configured_field
 
 
 def get_airtable_batch_record(batch_id):
@@ -1020,12 +1067,40 @@ def batch_verification_payload(batch_id, bucket=None):
         "item_side_linked_count": None,
         "batch_side_linked_count": None,
         "batch_side_link_field": "",
+        "collection_link_field": AIRTABLE_ITEM_COLLECTION_LINK_FIELD,
+        "location_link_field": AIRTABLE_ITEM_LOCATION_LINK_FIELD,
         "items_missing_collection": 0,
         "items_missing_location": 0,
         "warning": "",
     }
 
     try:
+        schema_tables = get_airtable_schema_tables()
+        collection_link_field = resolve_airtable_item_link_field(
+            schema_tables,
+            AIRTABLE_ITEM_COLLECTION_LINK_FIELD,
+            AIRTABLE_COLLECTIONS_TABLE_NAME,
+            [
+                "Collection (linked)",
+                "Collection linked",
+                "Collections",
+                "Collection",
+            ],
+        )
+        location_link_field = resolve_airtable_item_link_field(
+            schema_tables,
+            AIRTABLE_ITEM_LOCATION_LINK_FIELD,
+            AIRTABLE_LOCATIONS_TABLE_NAME,
+            [
+                "Location",
+                "Location (linked)",
+                "Location linked",
+                "Locations",
+            ],
+        )
+        airtable["collection_link_field"] = collection_link_field
+        airtable["location_link_field"] = location_link_field
+
         batch_record = get_airtable_batch_record(batch_id)
         if batch_record:
             item_records = airtable_item_records_for_batch(batch_record)
@@ -1037,11 +1112,11 @@ def batch_verification_payload(batch_id, bucket=None):
                 "batch_side_link_field": batch_side["field"],
                 "items_missing_collection": count_items_missing_field(
                     item_records,
-                    AIRTABLE_ITEM_COLLECTION_LINK_FIELD,
+                    collection_link_field,
                 ),
                 "items_missing_location": count_items_missing_field(
                     item_records,
-                    AIRTABLE_ITEM_LOCATION_LINK_FIELD,
+                    location_link_field,
                 ),
             })
         else:

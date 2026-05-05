@@ -282,6 +282,30 @@ class LookupOptionsTests(unittest.TestCase):
             ["Archive", "General", "Rare Books"],
         )
 
+    def test_resolve_item_link_field_uses_linked_table_when_configured_name_differs(self):
+        tables = [
+            {
+                "name": "Items",
+                "fields": [
+                    {
+                        "name": "Collections",
+                        "type": "multipleRecordLinks",
+                        "options": {"linkedTableId": "tblCollections"},
+                    },
+                ],
+            },
+            {"name": "Collections", "id": "tblCollections", "fields": []},
+        ]
+
+        field_name = app.resolve_airtable_item_link_field(
+            tables,
+            "Collection (linked)",
+            "Collections",
+            ["Collections"],
+        )
+
+        self.assertEqual(field_name, "Collections")
+
 
 class BatchVerificationTests(unittest.TestCase):
     def test_verification_checks_are_ok_when_counts_match(self):
