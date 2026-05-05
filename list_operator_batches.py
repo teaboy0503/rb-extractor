@@ -50,11 +50,14 @@ def batch_run_command(batch_id):
 def list_batch_ids(client):
     batch_ids = set()
     root_prefix = normalize_prefix(BATCH_UPLOAD_ROOT_PREFIX)
+    iterator = client.list_blobs(BUCKET_NAME, prefix=root_prefix, delimiter="/")
 
-    for blob in client.list_blobs(BUCKET_NAME, prefix=root_prefix):
-        parts = blob.name.split("/")
-        if len(parts) >= 2 and parts[1].startswith("batch-"):
-            batch_ids.add(parts[1])
+    for page in iterator.pages:
+        for prefix in page.prefixes:
+            parts = prefix.strip("/").split("/")
+            batch_id = parts[-1] if parts else ""
+            if batch_id.startswith("batch-"):
+                batch_ids.add(batch_id)
 
     return sorted(batch_ids)
 

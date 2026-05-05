@@ -28,7 +28,7 @@ MAX_OCR_CHARS_FOR_LLM = int(os.getenv("MAX_OCR_CHARS_FOR_LLM", "12000"))
 DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
 SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUTES", "60"))
-APP_VERSION = "1.7.0-operator-api"
+APP_VERSION = "1.8.0-operator-batches"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -312,8 +312,21 @@ def write_batch_manifest(manifest):
     return manifest_path
 
 
-def count_batch_uploads(batch_id):
-    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+def read_batch_manifest(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    blob = bucket.blob(f"{batch_root_prefix(batch_id)}batch.json")
+
+    if not blob.exists():
+        return {}
+
+    try:
+        return json.loads(blob.download_as_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def count_batch_uploads(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
     prefix = batch_input_prefix(batch_id)
     count = 0
 
@@ -324,8 +337,8 @@ def count_batch_uploads(batch_id):
     return count
 
 
-def batch_results_counts(batch_id):
-    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+def batch_results_counts(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
     blob = bucket.blob(batch_results_path(batch_id))
 
     if not blob.exists():
@@ -355,6 +368,46 @@ def batch_results_counts(batch_id):
     return counts
 
 
+def batch_status_payload(batch_id, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    manifest = read_batch_manifest(batch_id, bucket)
+
+    return {
+        "batch_id": batch_id,
+        "bucket": manifest.get("bucket") or DEFAULT_GCS_BUCKET,
+        "input_prefix": manifest.get("input_prefix") or batch_input_prefix(batch_id),
+        "results_path": manifest.get("results_path") or batch_results_path(batch_id),
+        "uploaded_count": count_batch_uploads(batch_id, bucket),
+        "results": batch_results_counts(batch_id, bucket),
+        "run_command": manifest.get("run_command") or batch_run_command(batch_id),
+        "source": manifest.get("source", ""),
+        "target_collection": manifest.get("target_collection", ""),
+        "location": manifest.get("location", ""),
+        "notes": manifest.get("notes", ""),
+        "created_at": manifest.get("created_at", ""),
+    }
+
+
+def list_operator_batch_ids(bucket):
+    batch_ids = set()
+    root_prefix = normalize_prefix(BATCH_UPLOAD_ROOT_PREFIX)
+
+    iterator = bucket.client.list_blobs(
+        DEFAULT_GCS_BUCKET,
+        prefix=root_prefix,
+        delimiter="/",
+    )
+
+    for page in iterator.pages:
+        for prefix in page.prefixes:
+            parts = prefix.strip("/").split("/")
+            batch_id = parts[-1] if parts else ""
+            if batch_id.startswith("batch-"):
+                batch_ids.add(batch_id)
+
+    return sorted(batch_ids, reverse=True)
+
+
 @app.get("/")
 def health():
     return {"status": "ok", "version": APP_VERSION}
@@ -376,6 +429,22 @@ async def create_batch(req: Request, body: CreateBatchRequest):
     return {
         **manifest,
         "manifest_path": manifest_path,
+    }
+
+
+@app.get("/batches")
+async def list_batches(req: Request, limit: int = 20):
+    require_bearer_auth(req)
+
+    limit = max(1, min(limit, 100))
+    bucket = get_bucket(DEFAULT_GCS_BUCKET)
+    batch_ids = list_operator_batch_ids(bucket)[:limit]
+    batches = [batch_status_payload(batch_id, bucket) for batch_id in batch_ids]
+    batches.sort(key=lambda batch: batch.get("created_at") or batch["batch_id"], reverse=True)
+
+    return {
+        "bucket": DEFAULT_GCS_BUCKET,
+        "batches": batches[:limit],
     }
 
 
@@ -420,16 +489,7 @@ async def get_batch_status(req: Request, batch_id: str):
     require_bearer_auth(req)
 
     batch_id = validate_batch_id(batch_id)
-
-    return {
-        "batch_id": batch_id,
-        "bucket": DEFAULT_GCS_BUCKET,
-        "input_prefix": batch_input_prefix(batch_id),
-        "results_path": batch_results_path(batch_id),
-        "uploaded_count": count_batch_uploads(batch_id),
-        "results": batch_results_counts(batch_id),
-        "run_command": batch_run_command(batch_id),
-    }
+    return batch_status_payload(batch_id)
 
 
 @app.post("/extract")

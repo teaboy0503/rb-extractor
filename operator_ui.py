@@ -283,6 +283,45 @@ OPERATOR_UI_HTML = """<!doctype html>
       padding-right: 2px;
     }
 
+    .batch-list {
+      display: grid;
+      gap: 8px;
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .batch-row {
+      display: grid;
+      gap: 4px;
+      width: 100%;
+      text-align: left;
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    .batch-row.active {
+      border-color: var(--accent);
+      background: #eef8f6;
+    }
+
+    .batch-row-title {
+      font-weight: 720;
+      overflow-wrap: anywhere;
+    }
+
+    .batch-row-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .empty-state {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 4px 0;
+    }
+
     .file-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 96px;
@@ -473,6 +512,17 @@ OPERATOR_UI_HTML = """<!doctype html>
             <div id="batchStatus" class="status-line"></div>
           </div>
         </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Recent Batches</h2>
+            <button id="listBatchesBtn" type="button">Refresh</button>
+          </div>
+          <div class="stack">
+            <div id="batchListStatus" class="status-line"></div>
+            <div id="batchList" class="batch-list"></div>
+          </div>
+        </div>
       </aside>
 
       <section>
@@ -563,6 +613,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       apiBase: sessionStorage.getItem("rb_api_base") || window.location.origin,
       batchId: sessionStorage.getItem("rb_batch_id") || "",
       batch: null,
+      batches: [],
       files: [],
       uploads: new Map()
     };
@@ -585,6 +636,9 @@ OPERATOR_UI_HTML = """<!doctype html>
       refreshBatchBtn: el("refreshBatchBtn"),
       existingBatchInput: el("existingBatchInput"),
       loadBatchBtn: el("loadBatchBtn"),
+      listBatchesBtn: el("listBatchesBtn"),
+      batchListStatus: el("batchListStatus"),
+      batchList: el("batchList"),
       batchStatus: el("batchStatus"),
       batchId: el("batchId"),
       bucketName: el("bucketName"),
@@ -662,6 +716,8 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.apiToken.value = "";
       nodes.apiBase.value = state.apiBase;
       setStatus(nodes.accessStatus, "Cleared.", "warn");
+      state.batches = [];
+      renderBatchList();
     }
 
     async function checkApi() {
@@ -711,6 +767,78 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.refreshBatchBtn.disabled = false;
       nodes.copyCommandBtn.disabled = !data.run_command;
       updateUploadButtons();
+      renderBatchList();
+    }
+
+    function formatBatchDate(value) {
+      if (!value) return "";
+
+      try {
+        return new Intl.DateTimeFormat(undefined, {
+          dateStyle: "short",
+          timeStyle: "short"
+        }).format(new Date(value));
+      } catch {
+        return value;
+      }
+    }
+
+    function renderBatchList() {
+      nodes.batchList.innerHTML = "";
+
+      if (!state.batches.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.textContent = "No recent batches loaded.";
+        nodes.batchList.appendChild(empty);
+        return;
+      }
+
+      for (const batch of state.batches) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = `batch-row ${batch.batch_id === state.batch?.batch_id ? "active" : ""}`.trim();
+
+        const title = document.createElement("div");
+        title.className = "batch-row-title";
+        title.textContent = batch.batch_id;
+
+        const meta = document.createElement("div");
+        meta.className = "batch-row-meta";
+        const parts = [
+          formatBatchDate(batch.created_at),
+          batch.location ? `Location: ${batch.location}` : "",
+          `Uploads: ${batch.uploaded_count ?? 0}`,
+          `Rows: ${batch.results?.total ?? 0}`,
+          `Failed: ${batch.results?.failed ?? 0}`
+        ].filter(Boolean);
+        meta.textContent = parts.join(" | ");
+
+        row.append(title, meta);
+        row.addEventListener("click", () => loadBatch(batch.batch_id));
+        nodes.batchList.appendChild(row);
+      }
+    }
+
+    async function listBatches(quiet = false) {
+      saveAccess();
+      if (!quiet) {
+        setStatus(nodes.batchListStatus, "Loading batches...");
+      }
+      nodes.listBatchesBtn.disabled = true;
+
+      try {
+        const data = await apiFetch("/batches?limit=20");
+        state.batches = data.batches || [];
+        renderBatchList();
+        setStatus(nodes.batchListStatus, `Loaded ${state.batches.length} recent batches.`, "ok");
+      } catch (error) {
+        if (!quiet) {
+          setStatus(nodes.batchListStatus, error.message, "error");
+        }
+      } finally {
+        nodes.listBatchesBtn.disabled = false;
+      }
     }
 
     async function loadBatch(batchId, quiet = false) {
@@ -759,6 +887,7 @@ OPERATOR_UI_HTML = """<!doctype html>
           uploaded_count: 0,
           results: { exists: false, total: 0, success: 0, failed: 0 }
         });
+        await listBatches(true);
         setStatus(nodes.batchStatus, `Created ${data.batch_id}.`, "ok");
       } catch (error) {
         setStatus(nodes.batchStatus, error.message, "error");
@@ -932,6 +1061,7 @@ OPERATOR_UI_HTML = """<!doctype html>
         failed ? "warn" : "ok"
       );
       await refreshBatch();
+      await listBatches(true);
       updateUploadButtons();
     }
 
@@ -952,6 +1082,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.apiBase.value = state.apiBase;
       nodes.existingBatchInput.value = state.batchId;
       updateBatchView(null);
+      renderBatchList();
       renderFiles();
 
       nodes.saveAccessBtn.addEventListener("click", saveAccess);
@@ -960,6 +1091,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.createBatchBtn.addEventListener("click", createBatch);
       nodes.refreshBatchBtn.addEventListener("click", refreshBatch);
       nodes.loadBatchBtn.addEventListener("click", () => loadBatch(nodes.existingBatchInput.value));
+      nodes.listBatchesBtn.addEventListener("click", () => listBatches());
       nodes.chooseFilesBtn.addEventListener("click", () => nodes.fileInput.click());
       nodes.fileInput.addEventListener("change", (event) => addFiles(event.target.files));
       nodes.uploadBtn.addEventListener("click", uploadSelected);
@@ -991,6 +1123,9 @@ OPERATOR_UI_HTML = """<!doctype html>
 
       if (state.token && state.batchId) {
         loadBatch(state.batchId, true);
+      }
+      if (state.token) {
+        listBatches(true);
       }
     }
 
