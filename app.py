@@ -50,7 +50,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.10-workflow-layout"
+APP_VERSION = "1.13.11-responsive-extract"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -2186,7 +2186,7 @@ async def run_batch(req: Request, batch_id: str, body: RunBatchRequest | None = 
 
 
 @app.post("/extract")
-async def extract(req: Request, body: ExtractRequest):
+def extract(req: Request, body: ExtractRequest):
     require_bearer_auth(req)
 
     image_bytes = download_gcs_bytes(body.gcs_bucket, body.gcs_object_path)
