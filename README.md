@@ -14,6 +14,18 @@ The page prompts for the API token in the browser and stores it in session stora
 Browser uploads use signed GCS `PUT` URLs, so the bucket must allow CORS for the
 Render origin before direct browser uploads will succeed.
 
+Set bucket CORS from Google Cloud Shell or a machine with `gcloud` installed:
+
+```bash
+gcloud storage buckets update gs://rb-title-pages-2026 --cors-file=gcs-cors.json
+```
+
+Check the applied CORS config:
+
+```bash
+gcloud storage buckets describe gs://rb-title-pages-2026 --format="default(cors_config)"
+```
+
 Create a batch:
 
 ```bash

@@ -1,0 +1,8 @@
+[
+  {
+    "origin": ["https://rb-extractor.onrender.com"],
+    "method": ["PUT", "GET", "HEAD"],
+    "responseHeader": ["Content-Type", "ETag"],
+    "maxAgeSeconds": 3600
+  }
+]
