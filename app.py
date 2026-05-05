@@ -38,6 +38,7 @@ DEFAULT_GCS_BUCKET = os.getenv("BATCH_GCS_BUCKET", "rb-title-pages-2026")
 BATCH_UPLOAD_ROOT_PREFIX = os.getenv("BATCH_UPLOAD_ROOT_PREFIX", "imports/")
 SIGNED_UPLOAD_EXPIRATION_MINUTES = int(os.getenv("SIGNED_UPLOAD_EXPIRATION_MINUTES", "60"))
 BATCH_RUN_LOCK_TTL_SECONDS = int(os.getenv("BATCH_RUN_LOCK_TTL_SECONDS", "21600"))
+BATCH_RUN_ORPHAN_GRACE_SECONDS = int(os.getenv("BATCH_RUN_ORPHAN_GRACE_SECONDS", "60"))
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Items")
@@ -1548,6 +1549,17 @@ def release_batch_run_lock(batch_id, run_id, bucket=None):
         pass
 
 
+def delete_batch_run_lock_generation(batch_id, generation, bucket=None):
+    bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
+    try:
+        bucket.blob(batch_run_lock_path(batch_id)).delete(
+            if_generation_match=int(generation)
+        )
+        return True
+    except (NotFound, PreconditionFailed, TypeError, ValueError):
+        return False
+
+
 def read_batch_stop_request(batch_id, bucket=None):
     bucket = bucket or get_bucket(DEFAULT_GCS_BUCKET)
     blob = bucket.blob(batch_run_stop_path(batch_id))
@@ -1629,6 +1641,22 @@ def normalize_run_status_for_lock(batch_id, run_status, bucket=None):
             **run_status,
             "status": "stale",
             "error": "Run lock expired. The previous run may have stopped.",
+            "lock_expires_at": lock.get("expires_at", ""),
+        }
+
+    run_id = run_status.get("run_id", "")
+    status_time = parse_datetime(run_status.get("updated_at")) or parse_datetime(run_status.get("started_at"))
+    orphaned_for = (
+        (datetime.now(UTC) - status_time).total_seconds()
+        if status_time
+        else BATCH_RUN_ORPHAN_GRACE_SECONDS + 1
+    )
+    if run_id and not running_batch_process(batch_id, run_id) and orphaned_for > BATCH_RUN_ORPHAN_GRACE_SECONDS:
+        delete_batch_run_lock_generation(batch_id, lock.get("generation"), bucket)
+        return {
+            **run_status,
+            "status": "stale",
+            "error": "No active worker process found for this run. It may have been interrupted by a deploy or restart.",
             "lock_expires_at": lock.get("expires_at", ""),
         }
 

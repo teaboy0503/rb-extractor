@@ -1,6 +1,7 @@
 import unittest
 import sys
 import types
+from datetime import UTC, datetime, timedelta
 
 
 def module(name):
@@ -321,6 +322,41 @@ class BatchVerificationTests(unittest.TestCase):
 
     def test_stopped_batch_can_be_started_again_without_waiting_uploads(self):
         self.assertTrue(app.can_start_batch_run({"status": "stopped"}, 0))
+
+    def test_orphaned_running_batch_becomes_stale(self):
+        original_read_lock = app.read_batch_run_lock
+        original_running_process = app.running_batch_process
+        original_delete_lock = app.delete_batch_run_lock_generation
+        original_grace = app.BATCH_RUN_ORPHAN_GRACE_SECONDS
+        deleted = []
+
+        try:
+            app.BATCH_RUN_ORPHAN_GRACE_SECONDS = 1
+            app.read_batch_run_lock = lambda batch_id, bucket=None: {
+                "run_id": "run-1",
+                "generation": "10",
+                "expired": False,
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            }
+            app.running_batch_process = lambda batch_id, run_id=None: None
+            app.delete_batch_run_lock_generation = lambda *args, **kwargs: deleted.append(args) or True
+
+            status = app.normalize_run_status_for_lock(
+                "batch-1",
+                {
+                    "status": "running",
+                    "run_id": "run-1",
+                    "updated_at": (datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+                },
+            )
+
+            self.assertEqual(status["status"], "stale")
+            self.assertTrue(deleted)
+        finally:
+            app.read_batch_run_lock = original_read_lock
+            app.running_batch_process = original_running_process
+            app.delete_batch_run_lock_generation = original_delete_lock
+            app.BATCH_RUN_ORPHAN_GRACE_SECONDS = original_grace
 
     def test_verification_checks_are_ok_when_counts_match(self):
         checks = app.build_batch_verification_checks(
