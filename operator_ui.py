@@ -792,6 +792,7 @@ OPERATOR_UI_HTML = """<!doctype html>
               <span class="metric-label">Unresolved</span>
             </div>
           </div>
+          <div id="verificationQueueNote" class="status-line warn hidden" style="margin-top:12px;"></div>
           <div id="verificationStatus" class="status-line" style="margin-top:12px;"></div>
           <div id="verificationList" class="verification-list"></div>
         </div>
@@ -878,6 +879,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       copyErrorReportBtn: el("copyErrorReportBtn"),
       refreshVerificationBtn: el("refreshVerificationBtn"),
       verificationStatus: el("verificationStatus"),
+      verificationQueueNote: el("verificationQueueNote"),
       verificationList: el("verificationList"),
       verifyKnownFiles: el("verifyKnownFiles"),
       verifyAirtableItems: el("verifyAirtableItems"),
@@ -1412,6 +1414,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         nodes.verifyAirtableItems.textContent = "0";
         nodes.verifyRemaining.textContent = "0";
         nodes.verifyFailures.textContent = "0";
+        nodes.verificationQueueNote.classList.add("hidden");
+        nodes.verificationQueueNote.textContent = "";
         setStatus(nodes.verificationStatus, state.batch?.batch_id ? "Run verification after processing." : "Load a batch to verify it.");
         return;
       }
@@ -1423,6 +1427,16 @@ OPERATOR_UI_HTML = """<!doctype html>
         : String(counts.airtable_item_records);
       nodes.verifyRemaining.textContent = String(counts.remaining_input_files ?? 0);
       nodes.verifyFailures.textContent = String(counts.unresolved_failure_rows ?? 0);
+
+      const remaining = Number(counts.remaining_input_files || 0);
+      if (remaining > 0) {
+        nodes.verificationQueueNote.classList.remove("hidden");
+        nodes.verificationQueueNote.textContent =
+          `${remaining} file${remaining === 1 ? "" : "s"} still waiting. This usually means the run reached its per-run file limit. Run the batch again to continue.`;
+      } else {
+        nodes.verificationQueueNote.classList.add("hidden");
+        nodes.verificationQueueNote.textContent = "";
+      }
 
       const status = verification.overall_status || "warn";
       const statusText = {

@@ -362,6 +362,8 @@ class BatchVerificationTests(unittest.TestCase):
         )
 
         self.assertEqual(app.verification_overall_status(checks), "warn")
+        waiting_check = next(check for check in checks if check["label"] == "Waiting files")
+        self.assertIn("run the batch again", waiting_check["detail"])
 
     def test_verification_ignores_already_successful_input_files(self):
         checks = app.build_batch_verification_checks(

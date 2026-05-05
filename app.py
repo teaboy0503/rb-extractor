@@ -49,7 +49,7 @@ AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD",
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
 AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.13.5-verification-waiting-files"
+APP_VERSION = "1.13.6-clear-waiting-files-note"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -1045,7 +1045,10 @@ def build_batch_verification_checks(
             verification_check(
                 "Waiting files",
                 "warn",
-                f"{remaining_input_count} file(s) still waiting in to_process.",
+                (
+                    f"{remaining_input_count} file(s) still waiting in to_process. "
+                    "This usually means the run reached its per-run file limit; run the batch again to continue."
+                ),
             )
         )
     elif run_state == "succeeded" and already_successful_input_count:
