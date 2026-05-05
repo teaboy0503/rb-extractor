@@ -971,6 +971,17 @@ OPERATOR_UI_HTML = """<!doctype html>
       setStatus(nodes.accessStatus, "Saved for this browser session.", "ok");
     }
 
+    async function saveAccessAndLoad() {
+      saveAccess();
+      if (!state.token) {
+        setStatus(nodes.batchStatus, "Enter and save the API token to load collections and locations.", "warn");
+        return;
+      }
+
+      await loadLookupOptions(false);
+      await listBatches(true);
+    }
+
     function clearAccess() {
       state.token = "";
       state.apiBase = window.location.origin;
@@ -983,6 +994,7 @@ OPERATOR_UI_HTML = """<!doctype html>
       state.lookupOptions = { collections: [], locations: [] };
       renderLookupOptions();
       renderBatchList();
+      setStatus(nodes.batchStatus, "Save API access to load collections and locations.", "warn");
     }
 
     function lookupNodes(kind) {
@@ -1006,7 +1018,8 @@ OPERATOR_UI_HTML = """<!doctype html>
         const data = await apiFetch("/");
         nodes.version.textContent = data.version ? `API ${data.version}` : "API ok";
         setStatus(nodes.accessStatus, "API reachable.", "ok");
-        await loadLookupOptions(true);
+        await loadLookupOptions(false);
+        await listBatches(true);
       } catch (error) {
         nodes.version.textContent = "API check failed";
         setStatus(nodes.accessStatus, error.message, "error");
@@ -1085,7 +1098,12 @@ OPERATOR_UI_HTML = """<!doctype html>
     }
 
     async function loadLookupOptions(quiet = false) {
-      if (!state.token) return;
+      if (!state.token) {
+        if (!quiet) {
+          setStatus(nodes.batchStatus, "Save API access to load collections and locations.", "warn");
+        }
+        return;
+      }
 
       try {
         const data = await apiFetch("/airtable-options");
@@ -2095,12 +2113,13 @@ OPERATOR_UI_HTML = """<!doctype html>
       nodes.apiBase.value = state.apiBase;
       nodes.existingBatchInput.value = state.batchId;
       updateBatchView(null);
+      renderLookupOptions();
       renderBatchList();
       renderVerification();
       renderFailures();
       renderFiles();
 
-      nodes.saveAccessBtn.addEventListener("click", saveAccess);
+      nodes.saveAccessBtn.addEventListener("click", saveAccessAndLoad);
       nodes.clearAccessBtn.addEventListener("click", clearAccess);
       nodes.checkApiBtn.addEventListener("click", checkApi);
       nodes.createBatchBtn.addEventListener("click", createBatch);
