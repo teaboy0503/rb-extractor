@@ -293,6 +293,44 @@ class BatchMetadataTests(unittest.TestCase):
 
         self.assertEqual(fields["Items count"], 17)
 
+    def test_batch_metadata_select_values_use_existing_choices(self):
+        airtable_importer.batch_manifest_cache = {"source": "web-upload"}
+        airtable_importer.cache_airtable_schema_tables([
+            {
+                "name": "Batches",
+                "fields": [
+                    {
+                        "name": "Source",
+                        "type": "singleSelect",
+                        "options": {"choices": [{"name": "Web upload"}]},
+                    },
+                ],
+            },
+        ])
+
+        fields = airtable_importer.build_batch_metadata_fields({})
+
+        self.assertEqual(fields["Source"], "Web upload")
+
+    def test_batch_metadata_skips_missing_select_choices(self):
+        airtable_importer.batch_manifest_cache = {"source": "web-upload"}
+        airtable_importer.cache_airtable_schema_tables([
+            {
+                "name": "Batches",
+                "fields": [
+                    {
+                        "name": "Source",
+                        "type": "singleSelect",
+                        "options": {"choices": [{"name": "Airtable"}]},
+                    },
+                ],
+            },
+        ])
+
+        fields = airtable_importer.build_batch_metadata_fields({})
+
+        self.assertNotIn("Source", fields)
+
 
 class LookupOptionsTests(unittest.TestCase):
     def test_lookup_display_name_prefers_configured_field(self):

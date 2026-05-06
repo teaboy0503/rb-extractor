@@ -273,6 +273,40 @@ def airtable_field_type(table_name, field_name):
     return (field or {}).get("type", "")
 
 
+def normalize_choice_name(value):
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+def airtable_select_choice_names(table_name, field_name):
+    field = airtable_schema_field(table_name, field_name)
+    return [
+        choice.get("name", "")
+        for choice in (field or {}).get("options", {}).get("choices", [])
+        if choice.get("name")
+    ]
+
+
+def value_for_airtable_field(table_name, field_name, value):
+    field_type = airtable_field_type(table_name, field_name)
+    if field_type not in {"singleSelect", "multipleSelect"}:
+        return value
+
+    choices = airtable_select_choice_names(table_name, field_name)
+    if not choices:
+        return value
+
+    value_key = normalize_choice_name(str(value))
+    for choice in choices:
+        if choice == value or normalize_choice_name(choice) == value_key:
+            return choice
+
+    print(
+        f"Skipping {table_name}.{field_name}: "
+        f"{value!r} is not an existing Airtable select option."
+    )
+    return None
+
+
 def airtable_field_exists(table_name, field_name):
     if not field_name:
         return False
@@ -619,7 +653,11 @@ def imported_by_payload():
 
 
 def add_if_field_exists(fields, table_name, field_name, value):
-    if field_name and value not in [None, ""] and airtable_field_exists(table_name, field_name):
+    if not field_name or value in [None, ""] or not airtable_field_exists(table_name, field_name):
+        return
+
+    value = value_for_airtable_field(table_name, field_name, value)
+    if value not in [None, ""]:
         fields[field_name] = value
 
 
@@ -637,7 +675,12 @@ def build_batch_metadata_fields(summary):
             if collection_record_id:
                 fields[AIRTABLE_BATCH_TARGET_COLLECTION_FIELD] = [collection_record_id]
         else:
-            fields[AIRTABLE_BATCH_TARGET_COLLECTION_FIELD] = collection_name
+            add_if_field_exists(
+                fields,
+                AIRTABLE_BATCH_TABLE_NAME,
+                AIRTABLE_BATCH_TARGET_COLLECTION_FIELD,
+                collection_name,
+            )
 
     if location_name and airtable_field_exists(AIRTABLE_BATCH_TABLE_NAME, AIRTABLE_BATCH_LOCATION_LINK_FIELD):
         location_record_id = batch_location_record_id()
@@ -680,7 +723,7 @@ def update_batch_summary(rows, summary):
     }
     fields.update(build_batch_metadata_fields(summary))
 
-    update_airtable_record(AIRTABLE_BATCH_TABLE_NAME, batch_record_id, fields, typecast=True)
+    update_airtable_record(AIRTABLE_BATCH_TABLE_NAME, batch_record_id, fields)
     print(f"Updated batch summary: {batch_name}")
 
 
