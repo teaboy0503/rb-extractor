@@ -201,11 +201,17 @@ class BatchMetadataTests(unittest.TestCase):
         self.original_manifest_cache = airtable_importer.batch_manifest_cache
         self.original_batch_target_collection = airtable_importer.BATCH_TARGET_COLLECTION
         self.original_batch_location = airtable_importer.BATCH_LOCATION
+        self.original_schema_cache = airtable_importer.airtable_schema_tables_cache
+        self.original_collection_lookup = airtable_importer.batch_collection_record_id
+        self.original_location_lookup = airtable_importer.batch_location_record_id
 
     def tearDown(self):
         airtable_importer.batch_manifest_cache = self.original_manifest_cache
         airtable_importer.BATCH_TARGET_COLLECTION = self.original_batch_target_collection
         airtable_importer.BATCH_LOCATION = self.original_batch_location
+        airtable_importer.airtable_schema_tables_cache = self.original_schema_cache
+        airtable_importer.batch_collection_record_id = self.original_collection_lookup
+        airtable_importer.batch_location_record_id = self.original_location_lookup
 
     def test_batch_manifest_keeps_collection_and_location(self):
         body = app.CreateBatchRequest(
@@ -244,6 +250,48 @@ class BatchMetadataTests(unittest.TestCase):
             airtable_importer.batch_metadata_value("target_collection", "Archive"),
             "Archive",
         )
+
+    def test_batch_metadata_fields_match_current_schema(self):
+        airtable_importer.batch_manifest_cache = {
+            "source": "web-upload",
+            "target_collection": "Scale Test",
+            "location": "TBD",
+        }
+        airtable_importer.batch_collection_record_id = lambda: "recCollection"
+        airtable_importer.batch_location_record_id = lambda: "recLocation"
+        airtable_importer.cache_airtable_schema_tables([
+            {
+                "name": "Batches",
+                "fields": [
+                    {"name": "Source", "type": "singleSelect"},
+                    {"name": "Target collection", "type": "singleLineText"},
+                    {"name": "Location ID", "type": "multipleRecordLinks"},
+                    {"name": "Items count", "type": "count"},
+                ],
+            },
+        ])
+
+        fields = airtable_importer.build_batch_metadata_fields({"successful_rows": 250})
+
+        self.assertEqual(fields["Source"], "web-upload")
+        self.assertEqual(fields["Target collection"], "Scale Test")
+        self.assertEqual(fields["Location ID"], ["recLocation"])
+        self.assertNotIn("Items count", fields)
+
+    def test_batch_metadata_fields_can_write_number_item_count(self):
+        airtable_importer.batch_manifest_cache = {}
+        airtable_importer.cache_airtable_schema_tables([
+            {
+                "name": "Batches",
+                "fields": [
+                    {"name": "Items count", "type": "number"},
+                ],
+            },
+        ])
+
+        fields = airtable_importer.build_batch_metadata_fields({"successful_rows": 17})
+
+        self.assertEqual(fields["Items count"], 17)
 
 
 class LookupOptionsTests(unittest.TestCase):

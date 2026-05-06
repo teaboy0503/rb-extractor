@@ -47,12 +47,12 @@ AIRTABLE_BATCH_NAME_FIELD = os.getenv("AIRTABLE_BATCH_NAME_FIELD", "Batch name")
 AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Related Batch")
 AIRTABLE_COLLECTIONS_TABLE_NAME = os.getenv("AIRTABLE_COLLECTIONS_TABLE_NAME", "Collections")
 AIRTABLE_COLLECTION_NAME_FIELD = os.getenv("AIRTABLE_COLLECTION_NAME_FIELD", "Collection name")
-AIRTABLE_ITEM_COLLECTION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_COLLECTION_LINK_FIELD", "Collection (linked)")
+AIRTABLE_ITEM_COLLECTION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_COLLECTION_LINK_FIELD", "Collections")
 AIRTABLE_LEGACY_COLLECTION_FIELD = os.getenv("AIRTABLE_LEGACY_COLLECTION_FIELD", "Collection")
 AIRTABLE_LOCATIONS_TABLE_NAME = os.getenv("AIRTABLE_LOCATIONS_TABLE_NAME", "Locations")
 AIRTABLE_LOCATION_NAME_FIELD = os.getenv("AIRTABLE_LOCATION_NAME_FIELD", "Location Code")
-AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Location")
-APP_VERSION = "1.14.0-direct-worker-extraction"
+AIRTABLE_ITEM_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_ITEM_LOCATION_LINK_FIELD", "Locations")
+APP_VERSION = "1.14.1-current-airtable-schema"
 
 app = FastAPI(title="RB Extractor", version=APP_VERSION)
 
@@ -1255,9 +1255,9 @@ def batch_verification_payload(batch_id, bucket=None):
             AIRTABLE_ITEM_COLLECTION_LINK_FIELD,
             AIRTABLE_COLLECTIONS_TABLE_NAME,
             [
+                "Collections",
                 "Collection (linked)",
                 "Collection linked",
-                "Collections",
                 "Collection",
             ],
         )
@@ -1266,10 +1266,11 @@ def batch_verification_payload(batch_id, bucket=None):
             AIRTABLE_ITEM_LOCATION_LINK_FIELD,
             AIRTABLE_LOCATIONS_TABLE_NAME,
             [
-                "Location",
+                "Locations",
                 "Location (linked)",
                 "Location linked",
-                "Locations",
+                "Location ID",
+                "Location",
             ],
         )
         airtable["collection_link_field"] = collection_link_field
@@ -2309,6 +2310,9 @@ def extract_from_gcs(gcs_bucket, gcs_object_path):
         "ocr_confidence": ocr_conf,
         "ocr_length": len(ocr_text),
         "llm_confidence": parsed.get("llm_confidence", 0.0),
+        "llm_model": OPENAI_MODEL,
+        "extraction_version": APP_VERSION,
+        "extraction_timestamp": datetime.now(UTC).isoformat(),
         "language": parsed.get("language", "") or "",
         "title": parsed.get("title", "") or "",
         "author": parsed.get("author", "") or "",
