@@ -265,6 +265,7 @@ class BatchMetadataTests(unittest.TestCase):
                 "fields": [
                     {"name": "Source", "type": "singleSelect"},
                     {"name": "Target collection", "type": "singleLineText"},
+                    {"name": "Collections ID", "type": "multipleRecordLinks"},
                     {"name": "Location ID", "type": "multipleRecordLinks"},
                     {"name": "Items count", "type": "count"},
                 ],
@@ -275,8 +276,30 @@ class BatchMetadataTests(unittest.TestCase):
 
         self.assertEqual(fields["Source"], "web-upload")
         self.assertEqual(fields["Target collection"], "Scale Test")
+        self.assertEqual(fields["Collections ID"], ["recCollection"])
         self.assertEqual(fields["Location ID"], ["recLocation"])
         self.assertNotIn("Items count", fields)
+
+    def test_batch_metadata_fields_ignore_missing_optional_batch_fields(self):
+        airtable_importer.batch_manifest_cache = {
+            "source": "web-upload",
+            "target_collection": "Scale Test",
+            "location": "TBD",
+        }
+        airtable_importer.batch_collection_record_id = lambda: "recCollection"
+        airtable_importer.batch_location_record_id = lambda: "recLocation"
+        airtable_importer.cache_airtable_schema_tables([
+            {
+                "name": "Batches",
+                "fields": [
+                    {"name": "Batch name", "type": "singleLineText"},
+                ],
+            },
+        ])
+
+        fields = airtable_importer.build_batch_metadata_fields({"successful_rows": 250})
+
+        self.assertEqual(fields, {})
 
     def test_batch_metadata_fields_can_write_number_item_count(self):
         airtable_importer.batch_manifest_cache = {}

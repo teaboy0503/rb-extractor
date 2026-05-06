@@ -29,11 +29,9 @@ AIRTABLE_BATCH_DATE_IMPORTED_FIELD = os.getenv("AIRTABLE_BATCH_DATE_IMPORTED_FIE
 AIRTABLE_BATCH_NOTES_FIELD = os.getenv("AIRTABLE_BATCH_NOTES_FIELD", "Batch Notes")
 AIRTABLE_BATCH_SOURCE_FIELD = os.getenv("AIRTABLE_BATCH_SOURCE_FIELD", "Source")
 AIRTABLE_BATCH_TARGET_COLLECTION_FIELD = os.getenv("AIRTABLE_BATCH_TARGET_COLLECTION_FIELD", "Target collection")
+AIRTABLE_BATCH_COLLECTION_LINK_FIELD = os.getenv("AIRTABLE_BATCH_COLLECTION_LINK_FIELD", "Collections ID")
 AIRTABLE_BATCH_LOCATION_LINK_FIELD = os.getenv("AIRTABLE_BATCH_LOCATION_LINK_FIELD", "Location ID")
 AIRTABLE_BATCH_ITEM_COUNT_FIELD = os.getenv("AIRTABLE_BATCH_ITEM_COUNT_FIELD", "Items count")
-AIRTABLE_BATCH_IMPORTED_BY_FIELD = os.getenv("AIRTABLE_BATCH_IMPORTED_BY_FIELD", "Imported by")
-AIRTABLE_IMPORTED_BY_USER_ID = os.getenv("AIRTABLE_IMPORTED_BY_USER_ID", "").strip()
-AIRTABLE_IMPORTED_BY_EMAIL = os.getenv("AIRTABLE_IMPORTED_BY_EMAIL", "").strip()
 AIRTABLE_ITEM_BATCH_LINK_FIELD = os.getenv("AIRTABLE_ITEM_BATCH_LINK_FIELD", "Related Batch")
 AIRTABLE_FAILURE_TABLE_NAME = os.getenv("AIRTABLE_FAILURE_TABLE_NAME", "")
 AIRTABLE_FAILURE_BATCH_LINK_FIELD = os.getenv("AIRTABLE_FAILURE_BATCH_LINK_FIELD", "")
@@ -533,15 +531,6 @@ def validate_required_airtable_fields():
     if AIRTABLE_ITEM_BATCH_LINK_FIELD not in items_fields:
         missing.append(f"{AIRTABLE_TABLE_NAME} -> {AIRTABLE_ITEM_BATCH_LINK_FIELD}")
 
-    batch_fields = table_fields(AIRTABLE_BATCH_TABLE_NAME)
-    for field_name in [
-        AIRTABLE_BATCH_SOURCE_FIELD,
-        AIRTABLE_BATCH_TARGET_COLLECTION_FIELD,
-        AIRTABLE_BATCH_LOCATION_LINK_FIELD,
-    ]:
-        if field_name and field_name not in batch_fields:
-            missing.append(f"{AIRTABLE_BATCH_TABLE_NAME} -> {field_name}")
-
     collection_name = batch_metadata_value("target_collection", BATCH_TARGET_COLLECTION)
     if collection_name and AIRTABLE_ITEM_COLLECTION_LINK_FIELD:
         resolved_item_collection_link_field = resolve_link_field(
@@ -644,14 +633,6 @@ def build_batch_summary(summary):
     ])
 
 
-def imported_by_payload():
-    if AIRTABLE_IMPORTED_BY_USER_ID:
-        return {"id": AIRTABLE_IMPORTED_BY_USER_ID}
-    if AIRTABLE_IMPORTED_BY_EMAIL:
-        return {"email": AIRTABLE_IMPORTED_BY_EMAIL}
-    return None
-
-
 def add_if_field_exists(fields, table_name, field_name, value):
     if not field_name or value in [None, ""] or not airtable_field_exists(table_name, field_name):
         return
@@ -659,6 +640,14 @@ def add_if_field_exists(fields, table_name, field_name, value):
     value = value_for_airtable_field(table_name, field_name, value)
     if value not in [None, ""]:
         fields[field_name] = value
+
+
+def add_link_if_field_exists(fields, table_name, field_name, record_id):
+    if not field_name or not record_id or not airtable_field_exists(table_name, field_name):
+        return
+
+    if airtable_field_type(table_name, field_name) == "multipleRecordLinks":
+        fields[field_name] = [record_id]
 
 
 def build_batch_metadata_fields(summary):
@@ -669,9 +658,18 @@ def build_batch_metadata_fields(summary):
 
     add_if_field_exists(fields, AIRTABLE_BATCH_TABLE_NAME, AIRTABLE_BATCH_SOURCE_FIELD, source)
 
+    collection_record_id = batch_collection_record_id() if collection_name else None
+    location_record_id = batch_location_record_id() if location_name else None
+
+    add_link_if_field_exists(
+        fields,
+        AIRTABLE_BATCH_TABLE_NAME,
+        AIRTABLE_BATCH_COLLECTION_LINK_FIELD,
+        collection_record_id,
+    )
+
     if collection_name and airtable_field_exists(AIRTABLE_BATCH_TABLE_NAME, AIRTABLE_BATCH_TARGET_COLLECTION_FIELD):
         if airtable_field_type(AIRTABLE_BATCH_TABLE_NAME, AIRTABLE_BATCH_TARGET_COLLECTION_FIELD) == "multipleRecordLinks":
-            collection_record_id = batch_collection_record_id()
             if collection_record_id:
                 fields[AIRTABLE_BATCH_TARGET_COLLECTION_FIELD] = [collection_record_id]
         else:
@@ -682,17 +680,12 @@ def build_batch_metadata_fields(summary):
                 collection_name,
             )
 
-    if location_name and airtable_field_exists(AIRTABLE_BATCH_TABLE_NAME, AIRTABLE_BATCH_LOCATION_LINK_FIELD):
-        location_record_id = batch_location_record_id()
-        if location_record_id:
-            fields[AIRTABLE_BATCH_LOCATION_LINK_FIELD] = [location_record_id]
-
-    imported_by = imported_by_payload()
-    if imported_by and airtable_field_exists(AIRTABLE_BATCH_TABLE_NAME, AIRTABLE_BATCH_IMPORTED_BY_FIELD):
-        if airtable_field_type(AIRTABLE_BATCH_TABLE_NAME, AIRTABLE_BATCH_IMPORTED_BY_FIELD) == "multipleCollaborators":
-            fields[AIRTABLE_BATCH_IMPORTED_BY_FIELD] = [imported_by]
-        else:
-            fields[AIRTABLE_BATCH_IMPORTED_BY_FIELD] = imported_by
+    add_link_if_field_exists(
+        fields,
+        AIRTABLE_BATCH_TABLE_NAME,
+        AIRTABLE_BATCH_LOCATION_LINK_FIELD,
+        location_record_id,
+    )
 
     if (
         summary
